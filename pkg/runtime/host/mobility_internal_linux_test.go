@@ -65,6 +65,69 @@ func parkedDelta(t *testing.T, dir string, m manifest, parent string) {
 	}
 }
 
+func TestDeltaOwnershipErrors(t *testing.T) {
+	down := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	defer down.Close()
+	cases := []struct {
+		name    string
+		setup   func(t *testing.T, dir string)
+		wantErr error
+	}{
+		{name: "malformed publication record", setup: func(t *testing.T, dir string) {
+			write(t, dir, map[string]string{remoteFile: "{"})
+		}},
+		{name: "unreadable publication record", setup: func(t *testing.T, dir string) {
+			if err := os.Mkdir(filepath.Join(dir, remoteFile), 0o700); err != nil {
+				t.Fatal(err)
+			}
+		}, wantErr: syscall.EISDIR},
+		{name: "incomplete publication record", setup: func(t *testing.T, dir string) {
+			write(t, dir, map[string]string{remoteFile: "{}"})
+		}},
+		{name: "invalid registry reference", setup: func(t *testing.T, dir string) {
+			if err := writeJSON(filepath.Join(dir, remoteFile), remoteRecord{Ref: "bad reference", Digest: "sha256:x"}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+		{name: "registry path is inaccessible", setup: func(t *testing.T, dir string) {
+			blocked := filepath.Join(t.TempDir(), "not-a-directory")
+			if err := os.WriteFile(blocked, []byte("blocked"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := writeJSON(filepath.Join(dir, remoteFile), remoteRecord{Ref: artifact.FileScheme + filepath.Join(blocked, "registry") + ":s", Digest: "sha256:x"}); err != nil {
+				t.Fatal(err)
+			}
+		}, wantErr: syscall.ENOTDIR},
+		{name: "registry is unavailable", setup: func(t *testing.T, dir string) {
+			if err := writeJSON(filepath.Join(dir, remoteFile), remoteRecord{Ref: down.URL + "/deltas:s", Digest: "sha256:x"}); err != nil {
+				t.Fatal(err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			tc.setup(t, dir)
+			r := &Runtime{}
+			owned, err := r.Owned(context.Background(), dir)
+			if owned || err == nil || (tc.wantErr != nil && !errors.Is(err, tc.wantErr)) {
+				t.Fatalf("Owned = %v, %v; want unknown ownership, cause %v", owned, err, tc.wantErr)
+			}
+			if _, err := os.Stat(filepath.Join(dir, remoteFile)); err != nil {
+				t.Fatalf("ownership check removed its evidence: %v", err)
+			}
+		})
+	}
+	t.Run("missing record retains legacy behavior, not exclusive ownership proof", func(t *testing.T) {
+		r := &Runtime{}
+		if owned, err := r.Owned(context.Background(), t.TempDir()); !owned || err != nil {
+			t.Fatalf("Owned without record = %v, %v", owned, err)
+		}
+	})
+}
+
 // TestRegistryMobility checks that home A publishes a parked session to the
 // shared registry, home B finds and claims it, and nothing unsigned,
 // unsealed, foreign or stale is taken. Steps run in order, each building on
@@ -185,19 +248,19 @@ func TestRegistryMobility(t *testing.T) {
 			}
 		}},
 		{"owned while the tag holds what was pushed", func(t *testing.T) {
-			if !a.Owned(ctx, deltaA) {
+			if owned, err := a.Owned(ctx, deltaA); err != nil || !owned {
 				t.Fatal("a just-published delta is not owned")
 			}
 			unpublished := filepath.Join(t.TempDir(), "local")
-			if !a.Owned(ctx, unpublished) {
+			if owned, err := a.Owned(ctx, unpublished); err != nil || !owned {
 				t.Fatal("a never-published delta is not owned")
 			}
 			unreachable := t.TempDir()
 			if err := writeJSON(filepath.Join(unreachable, remoteFile), remoteRecord{Ref: "bogus ref with spaces", Digest: "x"}); err != nil {
 				t.Fatal(err)
 			}
-			if !a.Owned(ctx, unreachable) {
-				t.Fatal("a delta whose registry cannot be asked must stay ours")
+			if owned, err := a.Owned(ctx, unreachable); err == nil || owned {
+				t.Fatal("a delta whose registry cannot be asked must have unknown ownership")
 			}
 		}},
 		{"found by a home that trusts the publisher", func(t *testing.T) {
@@ -332,7 +395,7 @@ func TestRegistryMobility(t *testing.T) {
 			if _, err := b.ClaimDelta(ctx, g, "S", rd); err == nil || !strings.Contains(err.Error(), "claimed or re-parked elsewhere") {
 				t.Fatalf("ClaimDelta = %v", err)
 			}
-			if !a.Owned(ctx, deltaA) {
+			if owned, err := a.Owned(ctx, deltaA); err != nil || !owned {
 				t.Fatal("the publisher lost the session to a failed claim")
 			}
 			found, _, err = b.FindDelta(ctx, g, "S")
@@ -364,7 +427,7 @@ func TestRegistryMobility(t *testing.T) {
 			if _, still, _ := artifact.Resolve(ctx, repo+":"+sessionTag("S")); still {
 				t.Fatal("the claimed session is still published")
 			}
-			if a.Owned(ctx, deltaA) {
+			if owned, err := a.Owned(ctx, deltaA); err != nil || owned {
 				t.Fatal("the publisher still believes it owns the session")
 			}
 			if _, ok, err := b.FindDelta(ctx, g, "S"); ok || err != nil {
@@ -562,8 +625,13 @@ func TestRetireDelta(t *testing.T) {
 					t.Fatalf("tag found = %v at %s, want the later park's digest, not %s", found, loc.Digest, before.Digest)
 				}
 			}
-			if !a.Owned(ctx, dir) {
-				t.Fatal("a retired delta must read as never published")
+			owned, oerr := a.Owned(ctx, dir)
+			if tc.wantErr {
+				if oerr == nil || owned {
+					t.Fatalf("failed retirement must leave ownership unknown: %v, %v", owned, oerr)
+				}
+			} else if oerr != nil || !owned {
+				t.Fatalf("successful retirement retains legacy local-resume behavior: %v, %v", owned, oerr)
 			}
 		})
 	}
@@ -871,7 +939,7 @@ func TestTenantKeepsPublishedSessionsApart(t *testing.T) {
 				t.Fatalf("FindDelta = %v %v, want found %v, err %v", found, err, tc.wantFound, tc.wantErr)
 			}
 			if !tc.wantFound {
-				if !a.Owned(ctx, deltaA) {
+				if owned, err := a.Owned(ctx, deltaA); err != nil || !owned {
 					t.Fatal("A no longer owns the session nobody claimed")
 				}
 				return
@@ -883,7 +951,7 @@ func TestTenantKeepsPublishedSessionsApart(t *testing.T) {
 			if got, _ := os.ReadFile(filepath.Join(dst, "pages-1.img")); string(got) != "dirty pages" {
 				t.Fatalf("claimed pages = %q", got)
 			}
-			if a.Owned(ctx, deltaA) {
+			if owned, err := a.Owned(ctx, deltaA); err != nil || owned {
 				t.Fatal("A still owns the session B claimed")
 			}
 		})

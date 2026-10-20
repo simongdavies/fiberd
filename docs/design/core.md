@@ -23,6 +23,7 @@ stateDiagram-v2
 - **Exits.** A fiber that dies on its own frees its slot and its session is forgotten. Its state is gone, so the ledger never calls it [parked](../glossary.md#park).
 - **Park publication.** A checkpoint returned by the runtime is recorded locally even if its publication fails. Park returns the local ref with an error, not success implying remote durability. The checkpoint stays available for a local resume and in the ledger snapshot. Runtimes that implement `DeltaPublicationPolicy` may explicitly disable publication; the host does so when no delta registry is configured, and local-only Park still succeeds. An enabled policy reports configuration, not reachability or durability, so failures of a configured publisher remain errors.
 - **Remote lookup.** A failed lookup is not evidence that a session is new. Clone returns a not-ready miss (or sheds while the issuer is unreachable), never a fresh fiber in place of state it could not look up.
+- **Unknown ownership.** An ownership-check error returns the same not-ready miss without forgetting the session, discarding its checkpoint, or attempting a lookup, claim or restore. A later retry may resume once ownership can be checked. `DeltaFinder.Owned` now returns `(bool, error)`: this is a Go source-API break for runtime implementers, not an RPC or checkpoint-format change.
 
 ```mermaid
 flowchart TD

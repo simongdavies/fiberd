@@ -464,7 +464,16 @@ func (a *Core) locate(ctx context.Context, g Grant, session string) (StatusCode,
 		return OK, nil
 	}
 	if st, ref, known := a.Ledger.SessionState(g.UID, session); known {
-		if st != StateParked || finder.Owned(ctx, ref) {
+		if st != StateParked {
+			return OK, nil
+		}
+		owned, err := finder.Owned(ctx, ref)
+		if err != nil {
+			log.Printf("mobility: ownership %s/%s: %v", g.UID, session, err)
+			err = fmt.Errorf("%w: ownership %s/%s: %w", ErrNotReady, g.UID, session, err)
+			return a.missCode(err), err
+		}
+		if owned {
 			return OK, nil
 		}
 		// The copy here is older state no one may resume. It goes, with

@@ -329,18 +329,25 @@ func (r *Runtime) pullParent(ctx context.Context, repo, sha string) error {
 	return nil
 }
 
-// Owned implements core.DeltaFinder: a published delta is still ours
-// while the tag holds the digest we pushed. Never published: ours.
-func (r *Runtime) Owned(ctx context.Context, deltaRef string) bool {
+// Owned implements core.DeltaFinder. A missing publication record keeps
+// the legacy local-resume behavior; it is not proof of exclusive ownership
+// after an uncertain publish, which may have committed before recording.
+func (r *Runtime) Owned(ctx context.Context, deltaRef string) (bool, error) {
 	var rec remoteRecord
 	if err := readJSON(filepath.Join(deltaRef, remoteFile), &rec); err != nil {
-		return true
+		if errors.Is(err, os.ErrNotExist) {
+			return true, nil
+		}
+		return false, fmt.Errorf("host: ownership record %s: %w", deltaRef, err)
+	}
+	if rec.Ref == "" || rec.Digest == "" {
+		return false, fmt.Errorf("host: incomplete ownership record %s", deltaRef)
 	}
 	loc, found, err := artifact.Resolve(ctx, rec.Ref)
 	if err != nil {
-		return true // cannot tell; keep serving what we have
+		return false, fmt.Errorf("host: ownership %s: %w", rec.Ref, err)
 	}
-	return found && loc.Digest == rec.Digest
+	return found && loc.Digest == rec.Digest, nil
 }
 
 // RetireDelta implements core.DeltaRetirer. The tag is deleted while it

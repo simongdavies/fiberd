@@ -46,6 +46,6 @@ flowchart LR
 
 - **Rollback within expiry.** Someone who can write the registry can put back an older park of the same session, signed and sealed as it was. A claiming home cannot tell it was superseded.
 - **Claim trusts the registry.** The claim relies on the registry answering not-found to the second delete of a tag. A registry that answers success twice lets two homes resume one session.
-- **Fresh-state fallback.** If the registry is unreachable, Clone creates the session fresh rather than wait for its parked state.
+- **Ownership uncertainty.** An unreadable, malformed or incomplete publication record, or a failed registry resolution, refuses the resume without deleting local state. A failed remote session lookup likewise refuses fresh-state creation. Missing publication records retain the legacy local-resume behavior; this is not evidence of exclusive ownership. A push can commit before its response arrives or before the local publication record is written. Durable publication-intent evidence and recovery of these ambiguous outcomes are still unresolved; neither this check nor the registry's separate resolve/delete operations qualify cross-home provider fencing.
 - **Endpoint topology on resume.** A direct TCP session cannot resume on every home ([networking.md](networking.md#security-notes-and-known-gaps)).
 - **Local deltas.** Deltas under `<state>/deltas` are neither signed nor sealed. [Fibers](../glossary.md#fiber) cannot see them, and they leave the home only through the registry.

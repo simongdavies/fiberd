@@ -193,9 +193,10 @@ type RemoteDelta struct {
 type DeltaFinder interface {
 	FindDelta(ctx context.Context, g Grant, session string) (RemoteDelta, bool, error)
 	ClaimDelta(ctx context.Context, g Grant, session string, rd RemoteDelta) (deltaRef string, err error)
-	// Owned reports whether a locally parked delta is still ours: false
-	// when another home has claimed the session since we published it.
-	Owned(ctx context.Context, deltaRef string) bool
+	// Owned reports whether a locally parked delta is still ours: false,
+	// nil when the published reference no longer names it. An error means
+	// ownership is unknown: the caller must neither resume nor discard it.
+	Owned(ctx context.Context, deltaRef string) (bool, error)
 }
 
 // Runtime is the seam between the invariant core and a mechanism. This

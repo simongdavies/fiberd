@@ -52,6 +52,7 @@ type mobileRuntime struct {
 	findErr    error // the store cannot be reached
 	claimErr   error // the pull fails, leaving the store as it was
 	discardErr error // dropping a claimed copy fails
+	ownedErr   error // ownership cannot be determined
 }
 
 func (m *mobileRuntime) key(g core.Grant, session string) string {
@@ -129,22 +130,25 @@ func (m *mobileRuntime) RetireDelta(_ context.Context, ref string) error {
 	return nil
 }
 
-func (m *mobileRuntime) Owned(_ context.Context, ref string) bool {
+func (m *mobileRuntime) Owned(_ context.Context, ref string) (bool, error) {
+	if m.ownedErr != nil {
+		return false, m.ownedErr
+	}
 	m.st.mu.Lock()
 	defer m.st.mu.Unlock()
 	for _, p := range m.st.deltas {
 		if p.ref == ref && p.owner == m {
-			return true
+			return true, nil
 		}
 	}
 	// Published and gone from the store: someone claimed it. Never
 	// published (no entry ever): ours.
 	for _, c := range m.st.claimedRefs {
 		if c == ref {
-			return false
+			return false, nil
 		}
 	}
-	return true
+	return true, nil
 }
 
 // nClaims is how many claims the runtime has made.
@@ -492,6 +496,75 @@ func TestParkPublicationFailure(t *testing.T) {
 			resumed, code, err := a.Clone(ctx, req)
 			if code != core.OK || err != nil || resumed.Kind != core.ActResume {
 				t.Fatalf("local resume = %+v, %d, %v", resumed, code, err)
+			}
+		})
+	}
+}
+
+type ownershipRuntime struct {
+	*mobileRuntime
+	cloneCalls int
+	findCalls  int
+}
+
+func (r *ownershipRuntime) Clone(ctx context.Context, spec core.CloneSpec) (core.FiberHandle, error) {
+	r.cloneCalls++
+	return r.mobileRuntime.Clone(ctx, spec)
+}
+
+func (r *ownershipRuntime) FindDelta(ctx context.Context, g core.Grant, session string) (core.RemoteDelta, bool, error) {
+	r.findCalls++
+	return r.mobileRuntime.FindDelta(ctx, g, session)
+}
+
+func TestUnknownOwnershipPreservesParkedState(t *testing.T) {
+	for _, issuerDown := range []bool{false, true} {
+		t.Run(fmt.Sprintf("issuer_down=%v", issuerDown), func(t *testing.T) {
+			g := core.Grant{UID: "g1", Tenant: "acme", Audience: "A", TemplateDigest: "sha256:t", FiberMax: 1}
+			st := &store{deltas: map[string]published{}}
+			a, mobile := newMobileCore(t, "A", st, g)
+			rt := &ownershipRuntime{mobileRuntime: mobile}
+			a.Runtime = rt
+			a.Store = &core.SnapshotStore{Path: filepath.Join(t.TempDir(), "ledger.json")}
+			ctx := context.Background()
+			req := core.CloneRequest{GrantJWT: []byte("g1"), Session: "S", Deadline: time.Second}
+			first, code, err := a.Clone(ctx, req)
+			if code != core.OK || err != nil {
+				t.Fatalf("Clone = %d, %v", code, err)
+			}
+			ref, code, err := a.Park(ctx, first.FiberID, true)
+			if code != core.OK || err != nil {
+				t.Fatalf("Park = %d, %v", code, err)
+			}
+			cloneCalls, findCalls := rt.cloneCalls, rt.findCalls
+			rt.ownedErr = errors.New("registry: ownership unavailable")
+			wantCode := core.DeferredFallback
+			if issuerDown {
+				a.Health.MarkSync(time.Now().Add(-time.Minute))
+				wantCode = core.Shed
+			}
+			resp, code, err := a.Clone(ctx, req)
+			if code != wantCode || !errors.Is(err, core.ErrNotReady) || !errors.Is(err, rt.ownedErr) || resp.FiberID != "" {
+				t.Fatalf("Clone with unknown ownership = %+v, %d, %v", resp, code, err)
+			}
+			state, savedRef, known := a.Ledger.SessionState("g1", "S")
+			if !known || state != core.StateParked || savedRef != ref {
+				t.Fatalf("local session = %v, %q, %v", state, savedRef, known)
+			}
+			snap, err := a.Store.Load()
+			if err != nil || len(snap.Sessions) != 1 || snap.Sessions[0].DeltaRef != ref || snap.Sessions[0].State != core.StateParked {
+				t.Fatalf("snapshot = %+v, %v", snap, err)
+			}
+			status, ok := coretest.GrantStatus(a.Ledger, "g1")
+			if !ok || status.Running != 0 || status.Parked != 1 || rt.cloneCalls != cloneCalls || rt.findCalls != findCalls ||
+				len(rt.claims) != 0 || len(rt.discarded) != 0 || len(rt.retired) != 0 || !st.stored("acme/sha256:t/S") {
+				t.Fatalf("ownership error changed state: status=%+v clones=%d finds=%d claims=%v discarded=%v retired=%v",
+					status, rt.cloneCalls, rt.findCalls, rt.claims, rt.discarded, rt.retired)
+			}
+			rt.ownedErr = nil
+			resumed, code, err := a.Clone(ctx, req)
+			if code != core.OK || err != nil || resumed.Kind != core.ActResume {
+				t.Fatalf("resume after ownership recovery = %+v, %d, %v", resumed, code, err)
 			}
 		})
 	}
