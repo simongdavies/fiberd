@@ -45,6 +45,8 @@ Before any of this, `helper --version` prints the same four facts on one line an
 - A `PARK` ends serving before the state is written, and the snapshot is complete when `PARKED` is sent. For `sync=true`, fiberd then fsyncs the host-side state before replying to the caller.
 - `CLONED` means the guest took its generation, fence and seed through `Incarnate` before the endpoint existed. No seed appears in the helper's log or in a park.
 - An `EXITED` follows every end, including one fiberd asked for.
+- `EXITED` is sent only after the sandbox and endpoint listener have been dropped on the fiber's thread, not before returning from a kill handler. `PARKED`, a successful `KILL` write, or loss of the helper's control channel is not this termination receipt.
+- Deploy the host with a helper build containing this drop-before-receipt correction. The wire format is unchanged; an older helper's version string alone does not prove it includes the corrected ordering.
 
 ## Implementations
 

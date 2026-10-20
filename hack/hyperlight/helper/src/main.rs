@@ -283,6 +283,9 @@ fn fiber_thread(ctl: Ctl, fence: String, endpoint: PathBuf, mut sb: MultiUseSand
         match cmds.try_recv() {
             Ok(Cmd::Kill) => {
                 let _ = std::fs::remove_file(&endpoint);
+                // EXITED is the host's termination receipt, not a kill request ack.
+                drop(sb);
+                drop(listener);
                 ctl.say(format!("EXITED {fence} exit:137"));
                 return;
             }
@@ -301,6 +304,8 @@ fn fiber_thread(ctl: Ctl, fence: String, endpoint: PathBuf, mut sb: MultiUseSand
                     }
                 }
                 if !sync {
+                    drop(sb);
+                    drop(listener);
                     ctl.say(format!("EXITED {fence} exit:0"));
                     return;
                 }
