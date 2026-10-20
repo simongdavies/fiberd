@@ -443,7 +443,7 @@ func (b *Backend) helperGone(h *helper) {
 	}
 	h.pmu.Unlock()
 	for _, id := range orphans {
-		b.exits <- backend.Exit{FiberID: id, Status: "signal:helper"}
+		b.exits <- backend.Exit{FiberID: id, Status: "signal:helper", Unconfirmed: true}
 	}
 	b.exits <- backend.Exit{WarmID: h.id, Status: "helper exited"}
 }

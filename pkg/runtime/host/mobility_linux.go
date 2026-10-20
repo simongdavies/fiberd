@@ -247,13 +247,46 @@ func (r *Runtime) ClaimDelta(ctx context.Context, g core.Grant, session string, 
 // delta store is touched. A tcp port the parked fiber kept for its resume
 // goes back with the delta.
 func (r *Runtime) DiscardDelta(_ context.Context, ref string) error {
+	if filepath.Clean(ref) != ref {
+		return fmt.Errorf("host: %s is not a canonical delta reference", ref)
+	}
 	rel, err := filepath.Rel(r.cfg.DeltaDir, ref)
 	if err != nil || rel == "." || rel == ".." || strings.HasPrefix(rel, "../") {
 		return fmt.Errorf("host: %s is not a delta of this home", ref)
 	}
+	// Bind native ownership to the admitted path, not the manifest. A
+	// claimed copy has no such local owner, even if its fence collides.
+	candidate := filepath.Dir(rel) + "/" + strings.Replace(filepath.Base(rel), "-", "/", 1)
+	owner := ""
+	if fence, err := core.ParseFence(candidate); err == nil && ref == r.deltaDir(fence) {
+		owner = fence.String()
+	}
+	// Missing or damaged metadata must not authorize deleting state
+	// belonging to a live dump or a saved pending park.
+	r.mu.Lock()
+	protected := owner != "" && (r.fibers[owner] != nil || r.parks[owner] != nil)
+	for _, p := range r.parks {
+		if p.parkRef == ref {
+			protected = true
+			break
+		}
+	}
+	r.mu.Unlock()
+	if protected {
+		return fmt.Errorf("%w: host: cannot discard live or pending checkpoint %s", core.ErrParkUnconfirmed, ref)
+	}
 	var m manifest
 	if err := readJSON(filepath.Join(ref, "manifest.json"), &m); err == nil && m.Fence != "" {
-		r.freePorts(m.Fence)
+		fence, err := core.ParseFence(m.Fence)
+		if err != nil {
+			log.Printf("host: discard %s: invalid fence, retaining endpoint reservations: %v", ref, err)
+		} else if ref == r.deltaDir(fence) {
+			// A claimed copy may name a colliding local fence. Only this
+			// home's native checkpoint path can own its parked reservation.
+			if !r.freePorts(fence.String()) {
+				return fmt.Errorf("%w: host: checkpoint %s still has a live or pending owner", core.ErrParkUnconfirmed, ref)
+			}
+		}
 	}
 	return os.RemoveAll(ref)
 }

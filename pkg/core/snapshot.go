@@ -25,12 +25,13 @@ type Snapshot struct {
 }
 
 type SessionSnapshot struct {
-	Name     string       `json:"name"`
-	GrantUID string       `json:"grant_uid"`
-	State    SessionState `json:"state"`
-	Fence    Fence        `json:"fence"`
-	DeltaRef string       `json:"delta_ref,omitempty"`
-	FiberID  string       `json:"fiber_id,omitempty"`
+	Name           string       `json:"name"`
+	GrantUID       string       `json:"grant_uid"`
+	State          SessionState `json:"state"`
+	Fence          Fence        `json:"fence"`
+	DeltaRef       string       `json:"delta_ref,omitempty"`
+	FiberID        string       `json:"fiber_id,omitempty"`
+	PendingParkRef string       `json:"pending_park_ref,omitempty"`
 }
 
 // Snapshot captures the ledger.
@@ -42,13 +43,34 @@ func (l *Ledger) Snapshot() Snapshot {
 		s.Grants = append(s.Grants, e.grant)
 	}
 	for _, sess := range l.sessions {
-		ss := SessionSnapshot{Name: sess.Name, GrantUID: sess.GrantUID, State: sess.State, Fence: sess.Fence, DeltaRef: sess.DeltaRef}
+		ss := SessionSnapshot{Name: sess.Name, GrantUID: sess.GrantUID, State: sess.State, Fence: sess.Fence, DeltaRef: sess.DeltaRef, PendingParkRef: sess.PendingParkRef}
 		if sess.State == StateRunning {
 			ss.FiberID = sess.Handle.ID
 		}
 		s.Sessions = append(s.Sessions, ss)
 	}
+	for id, f := range l.fibers {
+		if f.sessionKey == "" && f.pendingParkRef != "" {
+			s.Sessions = append(s.Sessions, SessionSnapshot{GrantUID: f.grantUID, State: StateRunning,
+				Fence: f.fence, FiberID: id, PendingParkRef: f.pendingParkRef})
+		}
+	}
 	return s
+}
+
+// installPendingLocked keeps the old slot reserved without making its endpoint
+// attachable or interpreting its saved checkpoint as a consumed source.
+// admitHeld prevalidates every entry before changing any ledger state.
+func (l *Ledger) installPendingLocked(s SessionSnapshot) {
+	g := l.grants[s.GrantUID]
+	key := ""
+	if s.Name != "" {
+		key = s.GrantUID + "/" + s.Name
+		l.sessions[key] = &Session{Name: s.Name, GrantUID: s.GrantUID, State: StateRunning,
+			Fence: s.Fence, Handle: FiberHandle{ID: s.FiberID}, DeltaRef: s.DeltaRef, PendingParkRef: s.PendingParkRef}
+	}
+	l.fibers[s.FiberID] = &fiberRef{grantUID: s.GrantUID, sessionKey: key, fence: s.Fence, pendingParkRef: s.PendingParkRef}
+	g.live++
 }
 
 // RestoreParked re-registers a parked session from a snapshot or a claim
@@ -69,6 +91,10 @@ var errSessionHeld = errors.New("ledger: session already held by this home")
 func (l *Ledger) restoreParked(s SessionSnapshot) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.restoreParkedLocked(s)
+}
+
+func (l *Ledger) restoreParkedLocked(s SessionSnapshot) error {
 	if _, ok := l.grants[s.GrantUID]; !ok {
 		return ErrGrantUnknown
 	}
@@ -76,8 +102,13 @@ func (l *Ledger) restoreParked(s SessionSnapshot) error {
 	if _, ok := l.sessions[key]; ok {
 		return errSessionHeld
 	}
-	l.sessions[key] = &Session{Name: s.Name, GrantUID: s.GrantUID, State: StateParked, Fence: s.Fence, DeltaRef: s.DeltaRef}
+	l.installParkedLocked(s)
 	return nil
+}
+
+func (l *Ledger) installParkedLocked(s SessionSnapshot) {
+	key := s.GrantUID + "/" + s.Name
+	l.sessions[key] = &Session{Name: s.Name, GrantUID: s.GrantUID, State: StateParked, Fence: s.Fence, DeltaRef: s.DeltaRef}
 }
 
 // SnapshotStore persists snapshots atomically at Path. Each write goes to
@@ -189,6 +220,49 @@ type heldGrant struct {
 // file.
 func (a *Core) Reconcile(ctx context.Context, snap Snapshot) (ReconcileReport, error) {
 	var rep ReconcileReport
+	pending := make(map[string]SessionSnapshot)
+	for i, s := range snap.Sessions {
+		if s.PendingParkRef == "" {
+			continue
+		}
+		fence, err := ParseFence(s.FiberID)
+		if err != nil || fence != s.Fence || fence.GrantUID != s.GrantUID || s.State != StateRunning || fence.Epoch >= a.Ledger.Epoch() {
+			return rep, fmt.Errorf("reconcile: invalid pending park identity %q", s.FiberID)
+		}
+		for j, other := range snap.Sessions {
+			if i != j && s.Name != "" && s.Name == other.Name && s.GrantUID == other.GrantUID {
+				return rep, fmt.Errorf("reconcile: duplicate pending session %s/%s", s.GrantUID, s.Name)
+			}
+		}
+		q, ok := a.Runtime.(ParkQuarantiner)
+		if !ok {
+			return rep, fmt.Errorf("reconcile: %w: runtime cannot quarantine %s at %s", ErrParkUnconfirmed, s.FiberID, s.PendingParkRef)
+		}
+		if err := q.QuarantinePark(ctx, s.FiberID, s.PendingParkRef); err != nil {
+			return rep, fmt.Errorf("reconcile: quarantine %s: %w", s.FiberID, err)
+		}
+		if _, duplicate := pending[s.FiberID]; duplicate {
+			return rep, fmt.Errorf("reconcile: duplicate pending park %s", s.FiberID)
+		}
+		pending[s.FiberID] = s
+	}
+	// Admit persists, so file pending evidence under held grants before
+	// any admission can replace the old snapshot.
+	heldPending := make(map[string]bool)
+	for _, s := range pending {
+		if !heldPending[s.GrantUID] {
+			g := Grant{UID: s.GrantUID}
+			for _, saved := range snap.Grants {
+				if saved.UID == s.GrantUID {
+					g = saved
+					break
+				}
+			}
+			a.hold(g)
+			heldPending[s.GrantUID] = true
+		}
+		a.holdParked(s)
+	}
 	now := a.Ledger.Now()
 	untokened := 0
 	for _, g := range snap.Grants {
@@ -252,6 +326,9 @@ func (a *Core) Reconcile(ctx context.Context, snap Snapshot) (ReconcileReport, e
 		return rep, fmt.Errorf("reconcile: list: %w", err)
 	}
 	for _, h := range running {
+		if _, quarantined := pending[h.ID]; quarantined {
+			continue
+		}
 		fence, perr := ParseFence(h.ID)
 		if perr == nil && fence.Epoch >= a.Ledger.Epoch() {
 			// Cannot happen (the epoch just moved), but never kill what
@@ -271,7 +348,7 @@ func (a *Core) Reconcile(ctx context.Context, snap Snapshot) (ReconcileReport, e
 	// runs after the runtime's List, once the runtime answers. Parked
 	// sessions keep their deltas.
 	for _, s := range snap.Sessions {
-		if s.State == StateRunning && s.DeltaRef != "" {
+		if s.State == StateRunning && s.DeltaRef != "" && s.PendingParkRef == "" {
 			a.discardDelta(ctx, s.Fence, s.Name, s.DeltaRef)
 		}
 	}
@@ -307,6 +384,10 @@ func (a *Core) hold(g Grant) {
 	if a.held == nil {
 		a.held = make(map[string]*heldGrant)
 	}
+	if h := a.held[g.UID]; h != nil {
+		h.grant = g
+		return
+	}
 	a.held[g.UID] = &heldGrant{grant: g}
 }
 
@@ -323,21 +404,57 @@ func (a *Core) holdParked(s SessionSnapshot) bool {
 	return ok
 }
 
-// restoreHeld registers the parked sessions held since boot under uid,
-// which Admit has just admitted again, and lets the held entry go.
-func (a *Core) restoreHeld(uid string) {
+// admitHeld makes the grant and all held reservations visible atomically.
+// Failed transfers leave the held evidence intact.
+func (a *Core) admitHeld(g Grant) error {
 	a.heldMu.Lock()
-	h, ok := a.held[uid]
-	delete(a.held, uid)
-	a.heldMu.Unlock()
-	if !ok {
-		return
+	defer a.heldMu.Unlock()
+	var sessions []SessionSnapshot
+	if h := a.held[g.UID]; h != nil {
+		sessions = h.sessions
 	}
-	for _, s := range h.sessions {
-		if !a.Ledger.RestoreParked(s) {
-			log.Printf("admit: parked session %s/%s held since boot was not restored; the ledger already holds the session", uid, s.Name)
+	l := a.Ledger
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	names, ids := make(map[string]bool), make(map[string]bool)
+	pendingCount, live := 0, 0
+	for _, f := range l.fibers {
+		if f.grantUID == g.UID {
+			live++
 		}
 	}
+	for _, s := range sessions {
+		if s.GrantUID != g.UID {
+			return fmt.Errorf("admit: held session grant %s differs from %s", s.GrantUID, g.UID)
+		}
+		if s.Name != "" {
+			key := g.UID + "/" + s.Name
+			if names[key] || l.sessions[key] != nil {
+				return fmt.Errorf("admit: %w: %s", errSessionHeld, key)
+			}
+			names[key] = true
+		}
+		if s.PendingParkRef != "" {
+			if s.FiberID == "" || ids[s.FiberID] || l.fibers[s.FiberID] != nil {
+				return fmt.Errorf("admit: %w: %s", errSessionHeld, s.FiberID)
+			}
+			ids[s.FiberID] = true
+			pendingCount++
+		}
+	}
+	if pendingCount > 0 && g.FiberMax > 0 && live+pendingCount > g.FiberMax {
+		return fmt.Errorf("admit: %w: %d held/running fibers exceed %d", ErrGrantFull, live+pendingCount, g.FiberMax)
+	}
+	l.admitGrantLocked(g)
+	for _, s := range sessions {
+		if s.PendingParkRef != "" {
+			l.installPendingLocked(s)
+		} else {
+			l.installParkedLocked(s)
+		}
+	}
+	delete(a.held, g.UID)
+	return nil
 }
 
 // snapshot is what persist writes. It is the ledger plus the entries boot
@@ -345,9 +462,9 @@ func (a *Core) restoreHeld(uid string) {
 // after boot would drop those grants and their parked sessions from the
 // file for good.
 func (a *Core) snapshot() Snapshot {
-	s := a.Ledger.Snapshot()
 	a.heldMu.Lock()
 	defer a.heldMu.Unlock()
+	s := a.Ledger.Snapshot()
 	if len(a.held) == 0 {
 		return s
 	}
@@ -356,8 +473,14 @@ func (a *Core) snapshot() Snapshot {
 		admitted[g.UID] = true
 	}
 	known := make(map[string]bool, len(s.Sessions))
+	key := func(sess SessionSnapshot) string {
+		if sess.Name == "" {
+			return sess.GrantUID + "/@fiber/" + sess.FiberID
+		}
+		return sess.GrantUID + "/@session/" + sess.Name
+	}
 	for _, sess := range s.Sessions {
-		known[sess.GrantUID+"/"+sess.Name] = true
+		known[key(sess)] = true
 	}
 	uids := make([]string, 0, len(a.held))
 	for uid := range a.held {
@@ -371,7 +494,7 @@ func (a *Core) snapshot() Snapshot {
 		h := a.held[uid]
 		s.Grants = append(s.Grants, h.grant)
 		for _, sess := range h.sessions {
-			if !known[sess.GrantUID+"/"+sess.Name] {
+			if !known[key(sess)] {
 				s.Sessions = append(s.Sessions, sess)
 			}
 		}

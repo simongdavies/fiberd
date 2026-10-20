@@ -64,6 +64,7 @@ type Runtime struct {
 	mu      sync.Mutex
 	warms   map[string]*warm  // grant uid
 	fibers  map[string]*fiber // fiber id (fence string)
+	parks   map[string]*fiber // saved park handshakes, retained through finish until acknowledged
 	poolSeq uint64            // names pool leaves, p-<n>, across every grant
 	ports   map[int]string    // tcp endpoints: port -> fiber id holding it
 	// socks maps each unix socket path a live fiber serves under the run
@@ -135,14 +136,19 @@ type warm struct {
 }
 
 type fiber struct {
-	id       string
-	grantUID string
-	pid      int
-	cg       cgroup.Dir
-	endpoint string // the URL Clone returned
-	port     int    // tcp endpoints: the port held while running or parked
-	sock     string // the unix socket path the backend serves under the run directory, "" for none
-	birth    string // the fence the fiber was born under, which it holds in memory across resumes
+	parkMu      sync.Mutex // serializes dump/termination retry and discarding release
+	parkRef     string
+	parkErr     error
+	parkSync    bool
+	quarantined bool // recovered without an in-process termination receipt
+	id          string
+	grantUID    string
+	pid         int
+	cg          cgroup.Dir
+	endpoint    string // the URL Clone returned
+	port        int    // tcp endpoints: the port held while running or parked
+	sock        string // the unix socket path the backend serves under the run directory, "" for none
+	birth       string // the fence the fiber was born under, which it holds in memory across resumes
 	// generation counts the fiber's lineage: 1 when born from the warm
 	// instance, the parked generation plus one when resumed. A park
 	// writes it into the manifest, so the count survives a move.
@@ -166,12 +172,16 @@ type fiber struct {
 	handoff bool
 	// relay is the tcp listener in front of a fiber that serves a unix
 	// socket on a tcp home. It is nil for every other fiber.
-	relay *relay
-	done  chan struct{}
+	relay      *relay
+	done       chan struct{}
+	terminated chan struct{} // positive incarnation exit plus completed host cleanup
 	// exit is what finish would have reported, kept when a park or
 	// release withheld it, so a park that fails after the fiber died can
 	// still report the death.
 	exit *core.FiberExit
+	// A provisional park may lose supervision before the dump fails.
+	// Keep that notification for rollback without calling it a real exit.
+	supervisionLoss *core.FiberExit
 }
 
 // New opens the runtime over cfg.Backend. It refuses a backend that
@@ -1003,7 +1013,7 @@ func (r *Runtime) pump() {
 		if overW {
 			reason, detail = "oom", e.Status+" "+why
 		}
-		r.finish(f, reason, detail)
+		r.finish(f, reason, detail, !e.Unconfirmed)
 	}
 }
 
@@ -1025,8 +1035,10 @@ func (r *Runtime) warmGone(grantUID string) {
 	r.protectTemplates()
 	r.discard(ps)
 	for _, f := range orphans {
-		_ = f.cg.Kill()
-		r.finish(f, "signal", "template instance exited")
+		if err := f.cg.Kill(); err != nil {
+			log.Printf("host: warm loss: kill %s: %v", f.id, err)
+		}
+		r.finish(f, "signal", "template instance exited", false)
 	}
 	log.Printf("host: warm instance gone grant=%s", grantUID)
 }
@@ -1057,10 +1069,18 @@ func (r *Runtime) DropTemplate(grantUID string) {
 	log.Printf("host: warm instance dropped grant=%s", grantUID)
 }
 
-func (r *Runtime) finish(f *fiber, reason, detail string) {
+func (r *Runtime) finish(f *fiber, reason, detail string, confirmed bool) {
 	r.mu.Lock()
 	if r.fibers[f.id] != f {
 		r.mu.Unlock()
+		return
+	}
+	if f.parked && !confirmed {
+		if f.supervisionLoss == nil {
+			f.supervisionLoss = &core.FiberExit{FiberID: f.id, Reason: reason, Detail: detail}
+		}
+		r.mu.Unlock()
+		log.Printf("host: %s lost supervision during park (%s: %s); deferring cleanup until the park outcome", f.id, reason, detail)
 		return
 	}
 	delete(r.fibers, f.id)
@@ -1093,6 +1113,9 @@ func (r *Runtime) finish(f *fiber, reason, detail string) {
 		r.freePort(f.port, f.id)
 	}
 	close(f.done)
+	if confirmed {
+		close(f.terminated)
+	}
 	if !released {
 		r.exits <- core.FiberExit{FiberID: f.id, Reason: reason, Detail: detail}
 	}
@@ -1170,16 +1193,21 @@ func (r *Runtime) allocPort(fiberID string, want int) (int, error) {
 	return 0, fmt.Errorf("host: no free endpoint port in %d-%d", lo, hi)
 }
 
-// freePorts gives back every port a fiber id holds: a parked delta's,
-// when the delta goes.
-func (r *Runtime) freePorts(fiberID string) {
+// freePorts releases a completed parked delta's reservations. A checkpoint
+// naming a live or pending incarnation is not authority to release its ports.
+func (r *Runtime) freePorts(fiberID string) bool {
 	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fibers[fiberID] != nil || r.parks[fiberID] != nil {
+		log.Printf("host: checkpoint cleanup retains endpoint reservations of live or pending %s", fiberID)
+		return false
+	}
 	for p, holder := range r.ports {
 		if holder == fiberID {
 			delete(r.ports, p)
 		}
 	}
-	r.mu.Unlock()
+	return true
 }
 
 func (r *Runtime) freePort(port int, fiberID string) {
@@ -1191,6 +1219,18 @@ func (r *Runtime) freePort(port int, fiberID string) {
 		delete(r.ports, port)
 	}
 	r.mu.Unlock()
+}
+
+// transferParkedPort checks ownership and both live and pending
+// incarnations atomically before handing a parked listener to a resume.
+func (r *Runtime) transferParkedPort(port int, from, to string) (int, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.fibers[from] != nil || r.parks[from] != nil || r.ports[port] != from {
+		return 0, fmt.Errorf("host: endpoint port %d is held by %s; cannot transfer from %s", port, r.ports[port], from)
+	}
+	r.ports[port] = to
+	return port, nil
 }
 
 // claimSocket reserves a unix socket path for a fiber, or refuses it
@@ -1333,7 +1373,7 @@ func (r *Runtime) start(ctx context.Context, z *warm, spec core.CloneSpec, p *po
 	// image, starts its lineage at generation 1.
 	f := &fiber{id: spec.Fence.String(), grantUID: spec.Grant.UID, cg: leaf, endpoint: url, port: port, sock: sock, birth: spec.Fence.String(),
 		generation: 1, budget: spec.Grant.WBudgetBytes, devMax: spec.Grant.DeviceBudget.Bytes,
-		quota: deltaQuota(spec.Grant), handoff: handoff, relay: rl, done: make(chan struct{}), pooled: p != nil}
+		quota: deltaQuota(spec.Grant), handoff: handoff, relay: rl, done: make(chan struct{}), terminated: make(chan struct{}), pooled: p != nil}
 	// Registered before the backend answers so an exit that races the
 	// reply is not lost.
 	r.mu.Lock()
@@ -1439,6 +1479,23 @@ func (r *Runtime) Park(ctx context.Context, fiberID string, sync bool) (string, 
 	}
 	r.mu.Lock()
 	f, ok := r.fibers[fiberID]
+	if saved := r.parks[fiberID]; saved != nil {
+		f, ok = saved, true
+	}
+	r.mu.Unlock()
+	if !ok {
+		return "", fmt.Errorf("host: unknown fiber %q", fiberID)
+	}
+	f.parkMu.Lock()
+	defer f.parkMu.Unlock()
+	if f.parkRef != "" {
+		return r.finishPark(ctx, f)
+	}
+	r.mu.Lock()
+	if r.fibers[fiberID] != f {
+		r.mu.Unlock()
+		return "", fmt.Errorf("host: fiber %q ended before park began", fiberID)
+	}
 	var ep string
 	var channel *os.File
 	if ok {
@@ -1453,6 +1510,7 @@ func (r *Runtime) Park(ctx context.Context, fiberID string, sync bool) (string, 
 	}
 	fence, err := core.ParseFence(f.id)
 	if err != nil {
+		r.unpark(f)
 		return "", fmt.Errorf("host: %w", err)
 	}
 	dir := r.deltaDir(fence)
@@ -1530,30 +1588,127 @@ func (r *Runtime) Park(ctx context.Context, fiberID string, sync bool) (string, 
 		if sync {
 			return giveBack(err)
 		}
-		return dir, err
+		f.parkErr = err
 	}
 	if sync {
 		// Everything is written. Make it durable, then end the fiber.
 		if err := syncDir(dir); err != nil {
 			return giveBack(err)
 		}
-		_ = r.be.Kill(f.id)
-		_ = f.cg.Kill()
 	}
-	// The exit is on its way or already handled, so wait for cleanup. The
-	// park is complete either way, and a wait that ends early is logged,
-	// not failed.
+	r.unroute(f)
+	if f.relay != nil {
+		f.relay.Close()
+	}
+	f.parkRef, f.parkSync = dir, sync
+	r.mu.Lock()
+	if r.parks == nil {
+		r.parks = make(map[string]*fiber)
+	}
+	r.parks[f.id] = f
+	r.mu.Unlock()
+	return r.finishPark(ctx, f)
+}
+
+// parkExitWait bounds termination confirmation, not checkpoint durability.
+var parkExitWait = 5 * time.Second
+
+// QuarantinePark reserves an old incarnation's endpoint without treating
+// missing processes or cgroups as proof that a helper-managed VM ended.
+func (r *Runtime) QuarantinePark(_ context.Context, fiberID, ref string) error {
+	fence, err := core.ParseFence(fiberID)
+	if err != nil {
+		return err
+	}
+	if filepath.Clean(ref) != filepath.Clean(r.deltaDir(fence)) {
+		return fmt.Errorf("host: pending checkpoint %s does not belong to %s", ref, fiberID)
+	}
+	var m manifest
+	if err := readJSON(filepath.Join(ref, "manifest.json"), &m); err != nil {
+		return fmt.Errorf("host: pending checkpoint manifest: %w", err)
+	}
+	if m.Fence != fiberID || m.GrantUID != fence.GrantUID {
+		return fmt.Errorf("host: pending checkpoint identity does not match %s", fiberID)
+	}
+	var ep endpoint.Endpoint
+	if !m.Handoff {
+		ep, err = endpoint.Parse(m.Endpoint)
+		if err != nil {
+			return err
+		}
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.parks[fiberID] != nil {
+		return nil
+	}
+	if ep.Scheme == "tcp" {
+		if holder := r.ports[ep.Port]; holder != "" && holder != fiberID {
+			return fmt.Errorf("host: pending endpoint port %d is held by %s", ep.Port, holder)
+		}
+	}
+	sock := ep.Path
+	if m.Relay != "" {
+		sock = m.Relay
+	}
+	if holder := r.socks[sock]; sock != "" && holder != "" && holder != fiberID {
+		return fmt.Errorf("host: pending endpoint socket %s is held by %s", sock, holder)
+	}
+	if ep.Scheme == "tcp" {
+		r.ports[ep.Port] = fiberID
+	}
+	if sock != "" {
+		r.socks[sock] = fiberID
+	}
+	if r.parks == nil {
+		r.parks = make(map[string]*fiber)
+	}
+	r.parks[fiberID] = &fiber{id: fiberID, grantUID: fence.GrantUID, parkRef: ref, quarantined: true}
+	return nil
+}
+
+func (r *Runtime) finishPark(ctx context.Context, f *fiber) (string, error) {
+	if f.quarantined {
+		return f.parkRef, fmt.Errorf("%w: host: %s recovered without termination proof; checkpoint retained at %s",
+			core.ErrParkUnconfirmed, f.id, f.parkRef)
+	}
+	complete := func() (string, error) {
+		r.mu.Lock()
+		delete(r.parks, f.id)
+		r.mu.Unlock()
+		return f.parkRef, f.parkErr
+	}
+	// Already reaped: command errors or cancellation cannot undo proof.
 	select {
-	case <-f.done:
-	case <-ctx.Done():
-		log.Printf("host: parked %s -> %s; not waiting for its exit: %v", fiberID, dir, ctx.Err())
-		return dir, nil
-	case <-time.After(5 * time.Second):
-		log.Printf("host: parked %s -> %s; it has not exited after 5s, cleanup continues", fiberID, dir)
-		return dir, nil
+	case <-f.terminated:
+		return complete()
+	default:
 	}
-	log.Printf("host: parked %s cgroup W=%d full image=%d delta=%v W bytes=%d -> %s", fiberID, w, full, m.Delta, m.WBytes, dir)
-	return dir, nil
+	var killErr error
+	if f.parkSync {
+		killErr = r.be.Kill(f.id)
+		killErr = errors.Join(killErr, f.cg.Kill())
+	}
+	timer := time.NewTimer(parkExitWait)
+	defer timer.Stop()
+	var waitErr error
+	select {
+	case <-f.terminated:
+		return complete()
+	case <-ctx.Done():
+		waitErr = ctx.Err()
+	case <-timer.C:
+		waitErr = context.DeadlineExceeded
+	}
+	select {
+	case <-f.terminated:
+		return complete()
+	default:
+	}
+	err := fmt.Errorf("%w: host: %s saved at %s, waiting for exit: %w",
+		core.ErrParkUnconfirmed, f.id, f.parkRef, errors.Join(f.parkErr, killErr, waitErr))
+	log.Print(err)
+	return f.parkRef, err
 }
 
 // unpark takes back a park that failed: the fiber runs again, its exit
@@ -1563,7 +1718,17 @@ func (r *Runtime) unpark(f *fiber) {
 	r.mu.Lock()
 	f.released, f.parked = false, false
 	exit := f.exit
+	loss := f.supervisionLoss
+	current := r.fibers[f.id] == f
+	f.supervisionLoss = nil
 	r.mu.Unlock()
+	if loss != nil && current {
+		// The dump failed, so this is the ordinary supervision-loss
+		// path, not a saved park. Finish cleanup, but never close the
+		// positive termination receipt.
+		r.finish(f, loss.Reason, loss.Detail, false)
+		return
+	}
 	if exit != nil {
 		r.exits <- *exit
 	}
@@ -1670,13 +1835,7 @@ func (r *Runtime) resume(ctx context.Context, spec core.CloneSpec) (core.FiberHa
 		// claimed from another home names a fence that may be a live
 		// fiber's here, whose port is its own.
 		if port, err = r.allocPort(spec.Fence.String(), parked.Port); err != nil {
-			r.mu.Lock()
-			_, live := r.fibers[m.Fence]
-			r.mu.Unlock()
-			if !live {
-				r.freePort(parked.Port, m.Fence)
-				port, err = r.allocPort(spec.Fence.String(), parked.Port)
-			}
+			port, err = r.transferParkedPort(parked.Port, m.Fence, spec.Fence.String())
 		}
 		if err != nil && m.Relay != "" {
 			// Nothing in a relayed checkpoint pins the port: the fiber
@@ -1739,7 +1898,7 @@ func (r *Runtime) resume(ctx context.Context, spec core.CloneSpec) (core.FiberHa
 	// in place of its parked one, with that record first on it.
 	f := &fiber{id: spec.Fence.String(), grantUID: spec.Grant.UID, cg: leaf, port: port, sock: sock, birth: birth.String(),
 		generation: m.Generation + 1, endpoint: served, budget: spec.Grant.WBudgetBytes, devMax: spec.Grant.DeviceBudget.Bytes,
-		quota: deltaQuota(spec.Grant), handoff: m.Handoff, relay: rl, done: make(chan struct{})}
+		quota: deltaQuota(spec.Grant), handoff: m.Handoff, relay: rl, done: make(chan struct{}), terminated: make(chan struct{})}
 	r.mu.Lock()
 	r.fibers[f.id] = f
 	r.mu.Unlock()
@@ -1800,6 +1959,33 @@ func (r *Runtime) HasDelta(ref string) bool {
 // runtime does not know (an orphan from a previous fiberd, found through
 // List) is killed through its leaf as well.
 func (r *Runtime) Release(ctx context.Context, fiberID string, discard bool) error {
+	r.mu.Lock()
+	f := r.parks[fiberID]
+	if f == nil {
+		f = r.fibers[fiberID]
+	}
+	r.mu.Unlock()
+	if f != nil {
+		f.parkMu.Lock()
+		defer f.parkMu.Unlock()
+	}
+	if f != nil && f.parkRef != "" {
+		if _, err := r.finishPark(ctx, f); errors.Is(err, core.ErrParkUnconfirmed) {
+			return err
+		} else if err != nil {
+			log.Printf("host: release %s after confirmed park exit: %v", fiberID, err)
+		}
+		if discard {
+			if err := os.RemoveAll(f.parkRef); err != nil {
+				r.mu.Lock()
+				r.parks[fiberID] = f
+				r.mu.Unlock()
+				return err
+			}
+			r.freePorts(fiberID)
+		}
+		return nil
+	}
 	r.mu.Lock()
 	f, ok := r.fibers[fiberID]
 	if ok {
@@ -1877,6 +2063,18 @@ func (r *Runtime) PruneGrants(keep map[string]bool) {
 	}
 	for _, g := range grants {
 		if keep[g.Name()] {
+			continue
+		}
+		r.mu.Lock()
+		quarantined := false
+		for _, f := range r.parks {
+			if f.grantUID == g.Name() {
+				quarantined = true
+				break
+			}
+		}
+		r.mu.Unlock()
+		if quarantined {
 			continue
 		}
 		_ = g.Kill()

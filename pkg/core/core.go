@@ -178,8 +178,9 @@ type Core struct {
 	devicesMu sync.Mutex
 	devices   map[string]heldDevices // grant uid -> the channel it holds
 
-	admitMu   sync.Mutex
-	admitting map[string]chan struct{}
+	admitMu            sync.Mutex
+	admitting          map[string]chan struct{}
+	admitBeforePublish func() // test barrier before held-state publication
 
 	changedMu sync.Mutex
 	changed   []chan struct{}
@@ -192,7 +193,8 @@ type Core struct {
 	// exitLookedUp, when set, is called by OnExit once it has looked the
 	// fiber up, with whether the ledger knew it. Tests use it to order an
 	// exit against a commit.
-	exitLookedUp func(fiberID string, known bool)
+	exitLookedUp     func(fiberID string, known bool)
+	exitBeforeSettle func() // test barrier before the atomic exit transition
 
 	// held are snapshot grants boot could not verify because the verifier
 	// was unavailable, with their parked sessions. They are not admitted,
@@ -656,6 +658,13 @@ func (a *Core) Admit(ctx context.Context, g Grant) (StatusCode, error) {
 			return NeedsTier, fmt.Errorf("%w: class %q", ErrNeedsDevice, g.DeviceBudget.Class)
 		}
 	}
+	if a.admitBeforePublish != nil {
+		a.admitBeforePublish()
+	}
+	if err := a.admitHeld(g); err != nil {
+		refuse()
+		return a.missCode(err), err
+	}
 	if a.Devices != nil {
 		a.devicesMu.Lock()
 		if a.devices == nil {
@@ -669,8 +678,6 @@ func (a *Core) Admit(ctx context.Context, g Grant) (StatusCode, error) {
 		}
 	}
 	dc := fresh.channel
-	a.Ledger.AdmitGrant(g)
-	a.restoreHeld(g.UID)
 	a.kickRefill()
 	detail := g.TemplateDigest
 	if dc.Kind != "" {
@@ -799,13 +806,8 @@ func (a *Core) BumpEpoch(ctx context.Context, reason string) (uint64, error) {
 		if !ok || fence.Epoch >= next {
 			continue
 		}
-		if err := a.Runtime.Release(ctx, id, false); err != nil {
-			log.Printf("epoch bump: release %s: %v", id, err)
-		}
-		// Parked deltas stay. A running fiber's resumed-from delta was
-		// consumed by that resume and goes with the fiber.
-		if session, deltaRef := a.Ledger.OnRelease(id); deltaRef != "" {
-			a.discardDelta(ctx, fence, session, deltaRef)
+		if !a.releaseRevoked(ctx, id, fence) {
+			continue
 		}
 		if err := a.audit(ctx, a.durability(fence.GrantUID), AuditRecord{Event: "scope-revoked", Fence: fence, FiberID: id, Detail: reason}); err != nil {
 			log.Printf("epoch bump: audit %s: %v", id, err)
@@ -854,10 +856,10 @@ func (a *Core) swept(g Grant, fence Fence) (StatusCode, error) {
 
 // Park checkpoints a named session's delta and frees its running tier.
 //
-// The ledger follows the runtime. Once Runtime.Park returns a ref, the
-// delta exists, so the session is parked in the ledger even if a later
-// step fails. Otherwise the slot leaks and the delta is orphaned. A failed
-// sync audit is returned only after the snapshot and watchers see it.
+// A completed runtime park updates the ledger even if a later step fails.
+// ErrParkUnconfirmed instead retains the saved ref and the running slot
+// until a retry confirms termination. A failed sync audit is returned only
+// after the snapshot and watchers see the completed park.
 func (a *Core) Park(ctx context.Context, fiberID string, sync bool) (string, StatusCode, error) {
 	fence, ok := a.Ledger.Fiber(fiberID)
 	if !ok {
@@ -870,14 +872,26 @@ func (a *Core) Park(ctx context.Context, fiberID string, sync bool) (string, Sta
 		if g, known := a.Ledger.Grant(fence.GrantUID); known && g.Tenant == "" {
 			return "", NeedsTier, fmt.Errorf("%w: grant %s, session %q", ErrNoTenant, g.UID, session)
 		}
-		// The session's gate, which Clone holds through a resume. A
-		// Clone(S) that arrives during the park waits until the delta is
-		// parked and published, so it never resumes a checkpoint that
-		// is then published as the session's current state.
-		hold := a.Ledger.holdSession(fence.GrantUID, session)
-		defer hold.release()
+	}
+	hold := a.Ledger.holdSession(fence.GrantUID, a.Ledger.FiberSession(fiberID))
+	defer hold.release()
+	return a.parkHeld(ctx, fiberID, fence, sync)
+}
+
+// parkHeld completes the existing park handshake under the session gate.
+func (a *Core) parkHeld(ctx context.Context, fiberID string, fence Fence, sync bool) (string, StatusCode, error) {
+	if _, known := a.Ledger.Fiber(fiberID); !known {
+		return "", NotFound, ErrFiberUnknown
 	}
 	ref, perr := a.Runtime.Park(ctx, fiberID, sync)
+	if errors.Is(perr, ErrParkUnconfirmed) {
+		if ref != "" {
+			a.Ledger.PendingPark(fiberID, ref)
+			a.persist()
+			a.notify()
+		}
+		return ref, Internal, perr
+	}
 	if ref == "" {
 		// Nothing was parked, so the fiber runs on and the ledger is right.
 		if errors.Is(perr, ErrDeltaQuota) {
@@ -933,6 +947,16 @@ func (a *Core) Release(ctx context.Context, fiberID string, discard bool) (Statu
 	if !ok {
 		return NotFound, ErrFiberUnknown
 	}
+	hold := a.Ledger.holdSession(fence.GrantUID, a.Ledger.FiberSession(fiberID))
+	defer hold.release()
+	if _, known := a.Ledger.Fiber(fiberID); !known {
+		return NotFound, ErrFiberUnknown
+	}
+	hadPendingPark := a.Ledger.PendingPark(fiberID, "") != ""
+	if hadPendingPark && !discard {
+		_, code, err := a.parkHeld(ctx, fiberID, fence, true)
+		return code, err
+	}
 	if err := a.Runtime.Release(ctx, fiberID, discard); err != nil {
 		return Internal, err
 	}
@@ -941,6 +965,9 @@ func (a *Core) Release(ctx context.Context, fiberID string, discard bool) (Statu
 		a.discardDelta(ctx, fence, session, deltaRef)
 	}
 	err := a.audit(ctx, a.durability(fence.GrantUID), AuditRecord{Event: "release", Fence: fence, FiberID: fiberID})
+	if hadPendingPark {
+		a.persist()
+	}
 	a.notify()
 	if err != nil {
 		return Internal, err
@@ -979,6 +1006,30 @@ func (a *Core) discardDelta(ctx context.Context, fence Fence, session, deltaRef 
 	_ = a.audit(ctx, BestEffort, AuditRecord{Event: "discard", Fence: fence, Session: session, Detail: deltaRef})
 }
 
+// releaseRevoked shares the session gate with Park. A sweep cannot turn
+// an in-flight saved checkpoint into a spontaneous death or a free slot.
+func (a *Core) releaseRevoked(ctx context.Context, fiberID string, fence Fence) bool {
+	hold := a.Ledger.holdSession(fence.GrantUID, a.Ledger.FiberSession(fiberID))
+	defer hold.release()
+	if _, known := a.Ledger.Fiber(fiberID); !known {
+		return true
+	}
+	if a.Ledger.PendingPark(fiberID, "") != "" {
+		if _, _, err := a.parkHeld(ctx, fiberID, fence, true); err != nil {
+			log.Printf("revoke: pending park %s: %v", fiberID, err)
+		}
+		_, known := a.Ledger.Fiber(fiberID)
+		return !known
+	}
+	if err := a.Runtime.Release(ctx, fiberID, false); err != nil {
+		log.Printf("revoke: release %s: %v", fiberID, err)
+	}
+	if session, deltaRef := a.Ledger.OnRelease(fiberID); deltaRef != "" {
+		a.discardDelta(ctx, fence, session, deltaRef)
+	}
+	return true
+}
+
 // Yield is the ladder's last rung and the reaper's verb: the grant is
 // revoked and every running fiber under it is released, each with its
 // audit record. Parked deltas are kept (they are the only state that
@@ -995,13 +1046,8 @@ func (a *Core) Yield(ctx context.Context, grantUID string, reason string) {
 		if !ok {
 			continue
 		}
-		if err := a.Runtime.Release(ctx, f.ID, false); err != nil {
-			log.Printf("yield %s: release %s: %v", grantUID, f.ID, err)
-		}
-		// Parked deltas stay. A running fiber's resumed-from delta was
-		// consumed by that resume and goes with the fiber.
-		if _, deltaRef := a.Ledger.OnRelease(f.ID); deltaRef != "" {
-			a.discardDelta(ctx, fence, f.Session, deltaRef)
+		if !a.releaseRevoked(ctx, f.ID, fence) {
+			continue
 		}
 		_ = a.audit(ctx, BestEffort, AuditRecord{Event: "yield", Fence: fence, Session: f.Session, FiberID: f.ID, Detail: reason})
 	}
@@ -1082,15 +1128,22 @@ func (a *Core) Run(ctx context.Context) {
 // a Clone that commits replays an exit held for it. An exit for a fiber
 // not yet committed is held until its Clone commits.
 func (a *Core) OnExit(ctx context.Context, ex FiberExit) {
+	if a.exitBeforeSettle != nil {
+		a.exitBeforeSettle()
+	}
 	a.pendingMu.Lock()
-	fence, session, deltaRef, ok := a.Ledger.OnFiberExit(ex.FiberID)
-	if !ok {
+	fence, session, deltaRef, ok, pending := a.Ledger.onFiberExit(ex.FiberID)
+	if !ok && !pending {
 		if a.pending == nil {
 			a.pending = make(map[string]FiberExit)
 		}
 		a.pending[ex.FiberID] = ex
 	}
 	a.pendingMu.Unlock()
+	if pending {
+		log.Printf("park %s: exit received during pending park; retaining checkpoint and capacity", ex.FiberID)
+		return
+	}
 	if a.exitLookedUp != nil {
 		a.exitLookedUp(ex.FiberID, ok)
 	}

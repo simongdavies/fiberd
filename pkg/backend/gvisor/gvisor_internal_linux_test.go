@@ -22,6 +22,7 @@ import (
 	"time"
 
 	"go.uber.org/goleak"
+	"golang.org/x/sys/unix"
 
 	"github.com/helayoty/fiberd/pkg/backend"
 	"github.com/helayoty/fiberd/pkg/core"
@@ -1610,6 +1611,43 @@ func TestReaperNeedsNoProcess(t *testing.T) {
 			case e := <-b.Exits():
 				t.Fatalf("the fiber's death was reported again: %+v", e)
 			default:
+			}
+		})
+	}
+}
+
+func TestFailedRunscWaitIsUnconfirmed(t *testing.T) {
+	b, _ := newFake(t, knobs{Fail: map[string]bool{"wait": true}})
+	if status, confirmed := b.reap("not-observed", 0); confirmed || status != "exit:?" {
+		t.Fatalf("failed wait/delete became positive exit proof: %q, %v", status, confirmed)
+	}
+}
+
+func TestAwaitExitRejectsPollFailures(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		err    error
+		events int16
+	}{
+		{name: "raw poll error", err: unix.EIO},
+		{name: "invalid descriptor", events: unix.POLLNVAL},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fd, err := unix.PidfdOpen(os.Getpid(), 0)
+			if err != nil {
+				t.Skipf("pidfd unavailable: %v", err)
+			}
+			if err := unix.Close(fd); err != nil {
+				t.Fatal(err)
+			}
+			old := pollPIDFD
+			t.Cleanup(func() { pollPIDFD = old })
+			pollPIDFD = func(fds []unix.PollFd, _ int) (int, error) {
+				fds[0].Revents = tc.events
+				return 1, tc.err
+			}
+			if status, confirmed := awaitExit(os.Getpid()); confirmed || status != "" {
+				t.Fatalf("poll failure became positive termination proof: %q, %v", status, confirmed)
 			}
 		})
 	}

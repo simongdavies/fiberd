@@ -4,6 +4,9 @@ import "errors"
 
 // Core errors.
 var (
+	// ErrParkUnconfirmed means a checkpoint was saved but the old
+	// incarnation has not been confirmed terminated. Keep its slot.
+	ErrParkUnconfirmed = errors.New("fiberd: parked incarnation termination unconfirmed")
 	ErrPayloadTooLarge = errors.New("fiberd: payload exceeds 4096 bytes")
 	ErrDeadline        = errors.New("fiberd: clone missed deadline")
 	ErrWrongAudience   = errors.New("fiberd: grant audience is not this home")

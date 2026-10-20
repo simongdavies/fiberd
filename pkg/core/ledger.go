@@ -27,6 +27,9 @@ type Session struct {
 	// incarnation was resumed from ("" after a create). That delta stays
 	// until the next park supersedes it or a Release discards it.
 	DeltaRef string
+	// PendingParkRef is a new checkpoint awaiting confirmed termination,
+	// not the older, consumed source in DeltaRef. The slot stays running.
+	PendingParkRef string
 }
 
 // Action is the resolved outcome of Clone(S): one verb, three costs.
@@ -102,10 +105,11 @@ type grantEntry struct {
 // fiberRef lets park/release/exit resolve a fiber ID back to the grant
 // slot it occupies and, for named sessions, the session to transition.
 type fiberRef struct {
-	grantUID   string
-	sessionKey string // "" for anonymous fibers
-	fence      Fence
-	wUsed      uint64
+	grantUID       string
+	sessionKey     string // "" for anonymous fibers
+	fence          Fence
+	wUsed          uint64
+	pendingParkRef string
 }
 
 func NewLedger(epoch uint64) *Ledger {
@@ -148,11 +152,21 @@ func (l *Ledger) BumpEpoch(epoch uint64) {
 func (l *Ledger) AdmitGrant(g Grant) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	l.admitGrantLocked(g)
+}
+
+func (l *Ledger) admitGrantLocked(g Grant) {
 	if e, ok := l.grants[g.UID]; ok {
 		e.grant = g
 		return
 	}
-	l.grants[g.UID] = &grantEntry{grant: g, nextSeq: l.seqHigh[g.UID]}
+	live := 0
+	for _, f := range l.fibers {
+		if f.grantUID == g.UID {
+			live++
+		}
+	}
+	l.grants[g.UID] = &grantEntry{grant: g, nextSeq: l.seqHigh[g.UID], live: live}
 }
 
 // Grant returns the admitted grant, if any.
@@ -326,6 +340,9 @@ func (l *Ledger) resolveHeld(hold *sessionHold, grantUID, session string, tier T
 		if s, ok := l.sessions[key]; ok {
 			switch s.State {
 			case StateRunning:
+				if s.PendingParkRef != "" {
+					return 0, Fence{}, "", nil, unlock, ErrParkUnconfirmed
+				}
 				// Attach returns the EXISTING fence: the incarnation did
 				// not change, so neither does what credentials bind to.
 				return ActAttach, s.Fence, s.Handle.Endpoint, commit, unlock, nil
@@ -488,11 +505,30 @@ func (l *Ledger) OnPark(fiberID, deltaRef string) (session, superseded string) {
 			superseded = s.DeltaRef
 			s.State = StateParked
 			s.DeltaRef = deltaRef
+			s.PendingParkRef = ""
 			s.Handle = FiberHandle{}
 			return s.Name, superseded
 		}
 	}
 	return "", ""
+}
+
+// PendingPark records or reads a saved checkpoint without freeing its slot.
+// An empty deltaRef only reads the current value.
+func (l *Ledger) PendingPark(fiberID, deltaRef string) string {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	f, ok := l.fibers[fiberID]
+	if !ok {
+		return ""
+	}
+	if deltaRef != "" {
+		f.pendingParkRef = deltaRef
+		if s := l.sessions[f.sessionKey]; s != nil {
+			s.PendingParkRef = deltaRef
+		}
+	}
+	return f.pendingParkRef
 }
 
 // OnRelease records a successful runtime Release: the slot is freed and
@@ -510,12 +546,29 @@ func (l *Ledger) OnRelease(fiberID string) (session, deltaRef string) {
 // fiber held and the session name, for the audit record, and the delta
 // the fiber was resumed from, for a discard.
 func (l *Ledger) OnFiberExit(fiberID string) (fence Fence, session, deltaRef string, ok bool) {
-	return l.onGone(fiberID)
+	fence, session, deltaRef, ok, _ = l.onFiberExit(fiberID)
+	return
+}
+
+// onFiberExit tests pending state and removes a spontaneous death under
+// one lock. Ignored park exits are not unknown, pre-commit fiber exits.
+func (l *Ledger) onFiberExit(fiberID string) (fence Fence, session, deltaRef string, ok, pending bool) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	if f := l.fibers[fiberID]; f != nil && f.pendingParkRef != "" {
+		return Fence{}, "", "", false, true
+	}
+	fence, session, deltaRef, ok = l.onGoneLocked(fiberID)
+	return
 }
 
 func (l *Ledger) onGone(fiberID string) (fence Fence, name, deltaRef string, ok bool) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	return l.onGoneLocked(fiberID)
+}
+
+func (l *Ledger) onGoneLocked(fiberID string) (fence Fence, name, deltaRef string, ok bool) {
 	ref, ok := l.fibers[fiberID]
 	if !ok {
 		return Fence{}, "", "", false

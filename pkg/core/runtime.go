@@ -155,6 +155,13 @@ type DeltaPublicationPolicy interface {
 	PublishesDeltas() bool
 }
 
+// ParkQuarantiner retains a saved checkpoint's endpoint reservation after
+// restart without inferring that its old incarnation has terminated.
+// A runtime without this capability cannot start with pending parks.
+type ParkQuarantiner interface {
+	QuarantinePark(ctx context.Context, fiberID, deltaRef string) error
+}
+
 // DeltaRetirer is implemented by runtimes that can withdraw a delta's
 // published copy. fiberd calls it once the session resumes here, so
 // the copy in the store no longer names state another home may take or
@@ -215,6 +222,8 @@ type Runtime interface {
 	// Park checkpoints the fiber's delta over the zygote and releases its
 	// running-tier resources. sync means the delta is durable before the
 	// call returns. Returns the delta ref for a later SourceDelta clone.
+	// A ref with ErrParkUnconfirmed is saved but not yet resumable: keep
+	// the running slot and retry Park, never create a second incarnation.
 	Park(ctx context.Context, fiberID string, sync bool) (deltaRef string, err error)
 
 	// Release destroys the fiber; discard also deletes any parked delta

@@ -203,12 +203,18 @@ type Handoffer interface {
 
 // Exit reports the end of a fiber (FiberID set), of a pooled sandbox
 // that was never bound (PooledID set) or of a warm instance (WarmID set,
-// the others empty: its fibers are gone with it).
+// the others empty). Warm/supervision loss alone is not a per-fiber
+// termination receipt.
 type Exit struct {
 	FiberID  string
 	PooledID string
 	WarmID   string
 	Status   string // "exit:N" or "signal:NAME"; free text otherwise
+	// Unconfirmed marks loss of supervision, not an observed incarnation
+	// exit. A pending park must not release capacity on this notification.
+	// False asserts an incarnation-specific exit receipt for FiberID;
+	// every synthetic notification and failed wait must explicitly set true.
+	Unconfirmed bool
 }
 
 // PoolSpec asks for one sandbox restored ahead of its identity.

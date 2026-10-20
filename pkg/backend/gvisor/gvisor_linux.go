@@ -945,19 +945,25 @@ func cgroupCurrent(fd int) uint64 {
 // some 20 MiB in fiberd's own leaf for each live fiber. Without a pid
 // the sandbox is already gone or runsc could not say, and `runsc wait`
 // sorts it out as before.
-func (b *Backend) reap(cid string, pid int) string {
+func (b *Backend) reap(cid string, pid int) (string, bool) {
 	status, ok := b.await(pid)
 	if !ok {
-		out, _ := b.runsc(context.Background(), -1, "wait", cid)
+		out, err := b.runsc(context.Background(), -1, "wait", cid)
+		ok = err == nil
+		if err != nil {
+			log.Printf("gvisor: wait %s did not confirm termination: %v", cid, err)
+		}
 		status = waitStatus(out)
 	}
 	_, _ = b.runsc(context.Background(), -1, "delete", "-force", cid)
-	return status
+	return status, ok
 }
 
 // awaitExit blocks until the process pid has exited and reports how,
 // or false when it cannot watch it. The pidfd is this process's hold on
 // that one incarnation of the pid, so a reused pid is never waited for.
+var pollPIDFD = unix.Poll
+
 func awaitExit(pid int) (string, bool) {
 	if pid <= 0 {
 		return "", false
@@ -974,15 +980,36 @@ func awaitExit(pid int) (string, bool) {
 	f := os.NewFile(uintptr(fd), "pidfd")
 	defer func() { _ = f.Close() }()
 	fds := []unix.PollFd{{Fd: int32(fd), Events: unix.POLLIN}}
+	observed := false
+	var waitErr error
 	exited := func(uintptr) bool {
-		n, err := unix.Poll(fds, 0)
-		return n > 0 || (err != nil && err != unix.EINTR && err != unix.EAGAIN)
+		n, err := pollPIDFD(fds, 0)
+		if errors.Is(err, unix.EINTR) || errors.Is(err, unix.EAGAIN) {
+			return false
+		}
+		if err != nil {
+			waitErr = err
+			return true
+		}
+		if n > 0 {
+			observed = fds[0].Revents&(unix.POLLIN|unix.POLLHUP) != 0
+			if !observed {
+				waitErr = fmt.Errorf("gvisor: unexpected pidfd poll events: %d", fds[0].Revents)
+			}
+			return true
+		}
+		return false
 	}
 	rc, err := f.SyscallConn()
 	if err != nil || rc.Read(exited) != nil {
 		for !exited(0) {
-			_, _ = unix.Poll(fds, -1)
+			if _, err := pollPIDFD(fds, -1); err != nil && !errors.Is(err, unix.EINTR) && !errors.Is(err, unix.EAGAIN) {
+				return "", false
+			}
 		}
+	}
+	if waitErr != nil || !observed {
+		return "", false
 	}
 	return exitStatus(pid), true
 }
@@ -1437,7 +1464,7 @@ func (b *Backend) start(ctx context.Context, w *warm, images string, argv []stri
 
 func (b *Backend) waitBox(x *box) {
 	defer b.reapers.Done()
-	status := b.reap(x.cid, x.pid)
+	status, confirmed := b.reap(x.cid, x.pid)
 	_ = os.RemoveAll(x.bundle)
 	b.mu.Lock()
 	known := false
@@ -1466,7 +1493,7 @@ func (b *Backend) waitBox(x *box) {
 	case pooled:
 		b.exits <- backend.Exit{PooledID: id, Status: status}
 	default:
-		b.exits <- backend.Exit{FiberID: id, Status: status}
+		b.exits <- backend.Exit{FiberID: id, Status: status, Unconfirmed: !confirmed}
 	}
 }
 

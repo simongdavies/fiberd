@@ -158,15 +158,17 @@ func (o Options) DumpWith(ctx context.Context, pid int, dir string, leaveRunning
 	return nil
 }
 
-// Restored is a running `criu restore`: it stays alive as the restored
-// tree's parent, so Wait returns when the tree exits.
+// Restored is a running `criu restore`. It normally stays alive as the
+// restored tree's parent, but abnormal supervisor exit need not end that tree.
 type Restored struct {
 	Process Process
 	PID     int // the restored root task
 	done    chan error
 }
 
-// Wait blocks until the restored tree (and criu) exit.
+// Wait reports the CRIU supervisor's completion, not the root's. Neither
+// nil nor an exit error proves root death: the root has no parent-death
+// signal, and foreground CRIU can return after a child-wait error.
 func (r *Restored) Wait() error { return <-r.done }
 
 // SocketInode returns the inode of the unix socket a process holds on fd,

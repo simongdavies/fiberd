@@ -8,6 +8,7 @@ import (
 	"errors"
 	"fmt"
 	"maps"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -19,12 +20,25 @@ import (
 	"github.com/helayoty/fiberd/pkg/artifact"
 	"github.com/helayoty/fiberd/pkg/backend"
 	"github.com/helayoty/fiberd/pkg/core"
+	"github.com/helayoty/fiberd/pkg/endpoint"
 )
 
 type parkGrantVerifier struct{ grant core.Grant }
 
 func (v parkGrantVerifier) Verify(context.Context, []byte) (core.Grant, error) {
 	return v.grant, nil
+}
+
+type observedParkRuntime struct {
+	*Runtime
+	published int
+}
+
+func (*observedParkRuntime) PublishesDeltas() bool { return true }
+
+func (r *observedParkRuntime) PublishDelta(context.Context, string, core.Grant, string) (string, error) {
+	r.published++
+	return "published", nil
 }
 
 func TestCoreParkPublicationConfiguration(t *testing.T) {
@@ -73,6 +87,532 @@ func TestCoreParkPublicationConfiguration(t *testing.T) {
 			resumed, code, err := a.Clone(ctx, req)
 			if err != nil || code != core.OK || resumed.Kind != core.ActResume {
 				t.Fatalf("local resume = %+v, %d, %v", resumed, code, err)
+			}
+		})
+	}
+}
+
+func TestCoreParkWaitFailureKeepsCapacity(t *testing.T) {
+	oldWait := parkExitWait
+	parkExitWait = 30 * time.Millisecond
+	t.Cleanup(func() { parkExitWait = oldWait })
+	killErr := errors.New("fake: kill denied")
+	for _, tc := range []struct {
+		name    string
+		sync    bool
+		cancel  bool
+		killErr error
+	}{
+		{name: "async timeout"},
+		{name: "sync timeout", sync: true},
+		{name: "async canceled", cancel: true},
+		{name: "sync canceled", sync: true, cancel: true},
+		{name: "sync kill failure", sync: true, killErr: killErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := core.Grant{UID: "g1", Tenant: "acme", TemplateDigest: "sha256:tmpl", FiberMax: 1, WBudgetBytes: 64 * mib,
+				Policy: core.Policy{Isolation: core.Trusted}}
+			be := newCodecBackend(core.TierCheckpoint)
+			be.noExit = true
+			be.killErr = tc.killErr
+			rt := newTestRuntime(t, be, nil)
+			observed := &observedParkRuntime{Runtime: rt}
+			a := &core.Core{Runtime: observed, Ledger: core.NewLedger(1), Verify: parkGrantVerifier{g},
+				RateLimit: core.NewRateLimit(1000, 256<<20),
+				Store:     &core.SnapshotStore{Path: filepath.Join(t.TempDir(), "ledger.json")}}
+			ctx := context.Background()
+			req := core.CloneRequest{GrantJWT: []byte("grant"), Session: "S", Deadline: time.Second}
+			first, code, err := a.Clone(ctx, req)
+			if err != nil || code != core.OK {
+				t.Fatalf("Clone = %d, %v", code, err)
+			}
+			pctx := ctx
+			wantErr := context.DeadlineExceeded
+			if tc.cancel {
+				var cancel context.CancelFunc
+				pctx, cancel = context.WithCancel(ctx)
+				cancel()
+				wantErr = context.Canceled
+			}
+			ref, code, err := a.Park(pctx, first.FiberID, tc.sync)
+			if ref == "" || !rt.HasDelta(ref) || code != core.Internal || !errors.Is(err, wantErr) ||
+				!errors.Is(err, core.ErrParkUnconfirmed) || (tc.killErr != nil && !errors.Is(err, tc.killErr)) {
+				t.Fatalf("Park without confirmed exit = %q, %d, %v", ref, code, err)
+			}
+			status := a.Ledger.Statuses()[0]
+			if status.Running != 1 || status.Parked != 0 {
+				t.Fatalf("unconfirmed termination freed capacity: %+v", status)
+			}
+			if observed.published != 0 {
+				t.Fatal("unconfirmed park was published")
+			}
+			if _, known := a.Ledger.Fiber(first.FiberID); !known {
+				t.Fatal("the unconfirmed fiber left the ledger")
+			}
+			snap, err := a.Store.Load()
+			if err != nil || len(snap.Sessions) != 1 || snap.Sessions[0].PendingParkRef != ref || snap.Sessions[0].State != core.StateRunning {
+				t.Fatalf("pending checkpoint not preserved in snapshot: %+v, %v", snap, err)
+			}
+			before, err := treeHashes(ref)
+			if err != nil {
+				t.Fatal(err)
+			}
+			a.OnExit(ctx, core.FiberExit{FiberID: first.FiberID, Reason: "exit"})
+			if again, _, err := a.Park(pctx, first.FiberID, tc.sync); again != ref || !errors.Is(err, core.ErrParkUnconfirmed) || len(be.parked()) != 1 {
+				t.Fatalf("retry redumped or lost pending park: %q, %v, dumps=%d", again, err, len(be.parked()))
+			}
+			again, _, err := a.Clone(ctx, req)
+			if err == nil || again.FiberID != "" {
+				t.Fatalf("pending park attached/restored a nonserving session: %+v, %v", again, err)
+			}
+			req.Session = "another"
+			if _, _, err := a.Clone(ctx, req); !errors.Is(err, core.ErrGrantFull) {
+				t.Fatalf("another session did not retain the capacity limit: %v", err)
+			}
+			noExit(t, rt)
+			be.die(first.FiberID, "signal:SIGKILL")
+			rt.mu.Lock()
+			pending := rt.parks[first.FiberID]
+			rt.mu.Unlock()
+			select {
+			case <-pending.done:
+			case <-time.After(time.Second):
+				t.Fatal("late exit was not reaped")
+			}
+			completed, code, err := a.Park(ctx, first.FiberID, tc.sync)
+			if completed != ref || code != core.OK || err != nil || len(be.parked()) != 1 {
+				t.Fatalf("late completion = %q, %d, %v", completed, code, err)
+			}
+			after, err := treeHashes(ref)
+			if err != nil || !maps.Equal(before, after) {
+				t.Fatalf("retry changed checkpoint: %v", err)
+			}
+			status = a.Ledger.Statuses()[0]
+			if status.Running != 0 || status.Parked != 1 || len(rt.parks) != 0 {
+				t.Fatalf("completed park leaked accounting/receipt: %+v", status)
+			}
+			if observed.published != 1 {
+				t.Fatalf("confirmed park published %d times", observed.published)
+			}
+			noExit(t, rt)
+			req.Session = "S"
+			resumed, code, err := a.Clone(ctx, req)
+			if code != core.OK || err != nil || resumed.Kind != core.ActResume {
+				t.Fatalf("resume completed park = %+v, %d, %v", resumed, code, err)
+			}
+		})
+	}
+}
+
+func TestRecoveredParkQuarantinesEndpoints(t *testing.T) {
+	for _, mode := range []string{"unix", "tcp", "handoff"} {
+		t.Run(mode, func(t *testing.T) {
+			rt := newTestRuntime(t, newCodecBackend(core.TierCheckpoint), func(cfg *Config) {
+				cfg.Endpoints = endpoint.Policy{Family: endpoint.Inet4, Host: "127.0.0.1", PortMin: 32001, PortMax: 32002}
+			})
+			fence := core.Fence{GrantUID: "g1", Epoch: 1, Seq: 1}
+			ref := rt.deltaDir(fence)
+			m := manifest{Fence: fence.String(), GrantUID: "g1", Endpoint: "tcp://127.0.0.1:32001"}
+			switch mode {
+			case "unix":
+				m.Endpoint = "unix://" + rt.unixPath(fence)
+			case "handoff":
+				m.Handoff, m.Endpoint = true, ""
+			}
+			write(t, ref, map[string]string{"pages.img": "saved state"})
+			if err := writeJSON(filepath.Join(ref, "manifest.json"), m); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			if err := rt.QuarantinePark(ctx, fence.String(), ref); err != nil {
+				t.Fatal(err)
+			}
+			switch mode {
+			case "tcp":
+				if _, err := rt.allocPort("replacement", 32001); err == nil {
+					t.Fatal("pending TCP endpoint was reused")
+				}
+				if _, err := rt.allocPort("unrelated", 0); err != nil {
+					t.Fatalf("unrelated endpoint blocked: %v", err)
+				}
+			case "unix":
+				if err := rt.claimSocket(rt.unixPath(fence), "replacement"); err == nil {
+					t.Fatal("pending socket was reused")
+				}
+			}
+			for _, discard := range []bool{false, true} {
+				if err := rt.Release(ctx, fence.String(), discard); !errors.Is(err, core.ErrParkUnconfirmed) {
+					t.Fatalf("quarantined release without proof = %v", err)
+				}
+			}
+			if got, err := rt.Park(ctx, fence.String(), true); got != ref || !errors.Is(err, core.ErrParkUnconfirmed) {
+				t.Fatalf("quarantined Park without proof = %q, %v", got, err)
+			}
+			if !exists(filepath.Join(ref, "pages.img")) || len(rt.be.(*codecBackend).killedIDs()) != 0 {
+				t.Fatal("quarantine discarded saved state or inferred a killable incarnation")
+			}
+			seedCgroup(t, rt.root.Child("g1"), liveFiles)
+			rt.PruneGrants(map[string]bool{})
+			if !rt.root.Child("g1").Exists() {
+				t.Fatal("grant pruning removed quarantined state")
+			}
+		})
+	}
+}
+
+func TestPendingParkDetachesRelay(t *testing.T) {
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	be := newCodecBackend(core.TierCheckpoint)
+	be.noExit = true
+	g := core.Grant{UID: "g1", TemplateDigest: "sha256:tmpl", FiberMax: 1}
+	f := newParkFixture(t, be, g, func(cfg *Config) {
+		cfg.Endpoints = endpoint.Policy{Family: endpoint.Inet4, Host: "127.0.0.1", PortMin: port, PortMax: port}
+	})
+	f.r.mu.Lock()
+	fiber := f.r.fibers[f.h.ID]
+	f.r.mu.Unlock()
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ref, err := f.r.Park(ctx, f.h.ID, true)
+	if !errors.Is(err, core.ErrParkUnconfirmed) || !f.r.HasDelta(ref) {
+		t.Fatalf("Park = %q, %v", ref, err)
+	}
+	fiber.relay.mu.Lock()
+	closed := fiber.relay.closed
+	fiber.relay.mu.Unlock()
+	if !closed {
+		t.Fatal("pending park still routes connections")
+	}
+	if _, err := f.r.allocPort("replacement", 0); err == nil {
+		t.Fatal("detaching the relay freed the pending endpoint reservation")
+	}
+}
+
+func TestWarmLossDoesNotConfirmPendingTermination(t *testing.T) {
+	be := newCodecBackend(core.TierCheckpoint)
+	be.noExit, be.killErr = true, errors.New("fake: kill failed")
+	g := core.Grant{UID: "g1", TemplateDigest: "sha256:tmpl", FiberMax: 1}
+	f := newParkFixture(t, be, g, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	ref, err := f.r.Park(ctx, f.h.ID, true)
+	if !errors.Is(err, core.ErrParkUnconfirmed) {
+		t.Fatal(err)
+	}
+	f.r.mu.Lock()
+	pending := f.r.parks[f.h.ID]
+	f.r.mu.Unlock()
+	plainOnly(t)
+	killPath := filepath.Join(pending.cg.Path, "cgroup.kill")
+	if err := os.Remove(killPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(killPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	f.r.DropTemplate("g1")
+	f.r.warmGone("g1")
+	if got, err := f.r.Park(ctx, f.h.ID, true); got != ref || !errors.Is(err, core.ErrParkUnconfirmed) {
+		t.Fatalf("warm control loss falsely completed pending park: %q, %v", got, err)
+	}
+	if !f.r.HasDelta(ref) {
+		t.Fatal("warm loss discarded checkpoint")
+	}
+	select {
+	case <-pending.terminated:
+		t.Fatal("synthetic cleanup supplied a positive termination receipt")
+	default:
+	}
+	be.die(f.h.ID, "signal:SIGKILL")
+	select {
+	case <-pending.terminated:
+	case <-time.After(time.Second):
+		t.Fatal("actual exit was not confirmed")
+	}
+	if got, err := f.r.Park(ctx, f.h.ID, true); got != ref || err != nil {
+		t.Fatalf("actual exit did not complete the retained park: %q, %v", got, err)
+	}
+}
+
+func TestFailedParkSettlesProvisionalSupervisionLoss(t *testing.T) {
+	be := newCodecBackend(core.TierCheckpoint)
+	be.noExit = true
+	be.parkErr = errors.New("fake helper: control channel lost during park")
+	gate := make(chan struct{})
+	be.parkGate = gate
+	g := core.Grant{UID: "g1", Tenant: "acme", TemplateDigest: "sha256:tmpl", FiberMax: 1,
+		Policy: core.Policy{Isolation: core.Trusted}}
+	rt := newTestRuntime(t, be, nil)
+	a := &core.Core{Runtime: rt, Ledger: core.NewLedger(1), Verify: parkGrantVerifier{g},
+		RateLimit: core.NewRateLimit(1000, 256<<20)}
+	ctx := context.Background()
+	first, code, err := a.Clone(ctx, core.CloneRequest{GrantJWT: []byte("grant"), Session: "S", Deadline: time.Second})
+	if err != nil || code != core.OK {
+		t.Fatalf("Clone = %d, %v", code, err)
+	}
+	rt.mu.Lock()
+	f := rt.fibers[first.FiberID]
+	rt.mu.Unlock()
+	done := make(chan error, 1)
+	go func() {
+		_, _, err := a.Park(ctx, first.FiberID, true)
+		done <- err
+	}()
+	waitFor(t, "park enters the helper barrier", func() bool { return len(be.parked()) == 1 })
+	be.report(backend.Exit{FiberID: first.FiberID, Status: "signal:helper", Unconfirmed: true})
+	waitFor(t, "pump retains provisional supervision loss", func() bool {
+		rt.mu.Lock()
+		defer rt.mu.Unlock()
+		return f.supervisionLoss != nil
+	})
+	rt.warmGone("g1")
+	close(gate)
+	if err := <-done; !errors.Is(err, be.parkErr) {
+		t.Fatalf("failed Park = %v", err)
+	}
+	select {
+	case ex := <-rt.Exits():
+		a.OnExit(ctx, ex)
+	case <-time.After(time.Second):
+		t.Fatal("failed park dropped provisional supervision loss; ghost fiber remains")
+	}
+	if _, known := a.Ledger.Fiber(first.FiberID); known {
+		t.Fatal("failed park left an attachable running ledger entry")
+	}
+	rt.mu.Lock()
+	_, live := rt.fibers[first.FiberID]
+	rt.mu.Unlock()
+	if live || len(rt.parks) != 0 {
+		t.Fatal("ordinary failed-park cleanup left a ghost runtime entry")
+	}
+	select {
+	case <-f.done:
+	default:
+		t.Fatal("ordinary failed-park cleanup did not settle its cleanup receipt")
+	}
+	select {
+	case <-f.terminated:
+		t.Fatal("supervision-loss cleanup was upgraded to positive termination proof")
+	default:
+	}
+	noExit(t, rt)
+}
+
+func TestResumeCannotStealQuarantinedPort(t *testing.T) {
+	be := newSandboxBackend(core.TierCheckpoint)
+	rt := newTestRuntime(t, be, func(cfg *Config) {
+		cfg.Endpoints = endpoint.Policy{Family: endpoint.Inet4, Host: "127.0.0.1", PortMin: 32001, PortMax: 32001}
+	})
+	old := core.Fence{GrantUID: "old", Epoch: 1, Seq: 1}
+	ref := rt.deltaDir(old)
+	m := manifest{Fence: old.String(), GrantUID: old.GrantUID, Endpoint: "tcp://127.0.0.1:32001", Backend: "fake"}
+	write(t, ref, map[string]string{"pages.img": "saved"})
+	if err := writeJSON(filepath.Join(ref, "manifest.json"), m); err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if err := rt.QuarantinePark(ctx, old.String(), ref); err != nil {
+		t.Fatal(err)
+	}
+	g := core.Grant{UID: "other", TemplateDigest: "sha256:tmpl", FiberMax: 1}
+	if err := rt.PrepareTemplate(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+	claimed := filepath.Join(rt.cfg.DeltaDir, "other", "claimed")
+	write(t, claimed, map[string]string{"pages.img": "claimed"})
+	if err := writeJSON(filepath.Join(claimed, "manifest.json"), m); err != nil {
+		t.Fatal(err)
+	}
+	be.resumeErr = errors.New("fake: restore failed")
+	_, err := rt.Clone(ctx, core.CloneSpec{Grant: g, Source: core.SourceDelta, Ref: claimed,
+		Fence: core.Fence{GrantUID: g.UID, Epoch: 2, Seq: 1}})
+	if err == nil {
+		t.Fatal("colliding restore succeeded")
+	}
+	rt.mu.Lock()
+	holder := rt.ports[32001]
+	rt.mu.Unlock()
+	if holder != old.String() {
+		t.Fatalf("restore failure stole quarantined reservation: %q", holder)
+	}
+}
+
+func TestRelayedConsumedDeltaCannotFreePendingPort(t *testing.T) {
+	be := relayBackend(core.TierCheckpoint)
+	be.noExit = true
+	g := core.Grant{UID: "g1", Tenant: "acme", TemplateDigest: "sha256:tmpl", FiberMax: 3,
+		Policy: core.Policy{Isolation: core.Trusted}}
+	rt := newTestRuntime(t, be, func(cfg *Config) {
+		cfg.Endpoints = endpoint.Policy{Family: endpoint.Inet4, Host: "127.0.0.1", PortMin: 20000, PortMax: 20001}
+	})
+	a := &core.Core{Runtime: rt, Ledger: core.NewLedger(1), Verify: parkGrantVerifier{g},
+		RateLimit: core.NewRateLimit(1000, 256<<20)}
+	ctx := context.Background()
+	req := core.CloneRequest{GrantJWT: []byte("grant"), Session: "pending", Deadline: time.Second}
+	first, code, err := a.Clone(ctx, req)
+	if err != nil || code != core.OK {
+		t.Fatalf("Clone = %d, %v", code, err)
+	}
+	oldEndpoint, err := endpoint.Parse(first.Endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	canceled, cancel := context.WithCancel(ctx)
+	cancel()
+	saved, _, err := a.Park(canceled, first.FiberID, true)
+	if !errors.Is(err, core.ErrParkUnconfirmed) {
+		t.Fatalf("pending Park = %v", err)
+	}
+	rt.mu.Lock()
+	pending := rt.parks[first.FiberID]
+	rt.mu.Unlock()
+	be.mu.Lock()
+	be.noExit = false
+	be.mu.Unlock()
+	claimed := filepath.Join(rt.cfg.DeltaDir, "g1", "claimed-foreign")
+	write(t, claimed, map[string]string{"pages.img": "foreign saved state"})
+	m := manifest{Fence: first.FiberID, GrantUID: "g1", Backend: "fake", Endpoint: first.Endpoint,
+		Relay: filepath.Join(rt.cfg.RunDir, "g1", "foreign.sock")}
+	if err := writeJSON(filepath.Join(claimed, "manifest.json"), m); err != nil {
+		t.Fatal(err)
+	}
+	if !a.Ledger.RestoreParked(core.SessionSnapshot{Name: "foreign", GrantUID: "g1", State: core.StateParked, DeltaRef: claimed}) {
+		t.Fatal("could not register the unrelated claimed checkpoint")
+	}
+	req.Session = "foreign"
+	resumed, code, err := a.Clone(ctx, req)
+	if err != nil || code != core.OK || resumed.Kind != core.ActResume || resumed.Endpoint == first.Endpoint {
+		t.Fatalf("relay fallback resume = %+v, %d, %v", resumed, code, err)
+	}
+	if got := mustSay(t, resumed.Endpoint, "ping"); got != resumed.FiberID+":ping" {
+		t.Fatalf("relayed resumed fiber answered %q", got)
+	}
+	if _, err := a.Release(ctx, resumed.FiberID, true); err != nil {
+		t.Fatal(err)
+	}
+	if exists(claimed) {
+		t.Fatal("consumed source was not discarded")
+	}
+	// All cleanup callers, not only DiscardDelta, must check active
+	// ownership before releasing reservations named by a checkpoint.
+	rt.freePorts(first.FiberID)
+	req.Session = "probe"
+	probe, code, err := a.Clone(ctx, req)
+	if err != nil || code != core.OK {
+		t.Fatalf("probe clone = %d, %v", code, err)
+	}
+	probeEndpoint, err := endpoint.Parse(probe.Endpoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rt.mu.Lock()
+	holder := rt.ports[oldEndpoint.Port]
+	stillPending := rt.parks[first.FiberID] == pending
+	rt.mu.Unlock()
+	if holder != first.FiberID || !stillPending || probeEndpoint.Port == oldEndpoint.Port || !rt.HasDelta(saved) {
+		t.Fatalf("checkpoint cleanup reused pending endpoint: holder=%q pending=%v probe=%s", holder, stillPending, probe.Endpoint)
+	}
+	be.die(first.FiberID, "signal:SIGKILL")
+	select {
+	case <-pending.terminated:
+	case <-time.After(time.Second):
+		t.Fatal("late root exit was not confirmed")
+	}
+	if _, code, err := a.Park(ctx, first.FiberID, true); code != core.OK || err != nil {
+		t.Fatalf("confirmed pending Park = %d, %v", code, err)
+	}
+	a.Ledger.ForgetSession("g1", "pending")
+	if err := rt.DiscardDelta(ctx, saved); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := rt.allocPort("completed-probe", oldEndpoint.Port); err != nil {
+		t.Fatalf("legitimate completed checkpoint cleanup leaked its port: %v", err)
+	}
+	rt.freePort(oldEndpoint.Port, "completed-probe")
+}
+
+func TestPendingParkReleaseAndRevocation(t *testing.T) {
+	for _, action := range []string{"release", "discard", "yield", "epoch", "anonymous discard"} {
+		t.Run(action, func(t *testing.T) {
+			g := core.Grant{UID: "g1", Tenant: "acme", TemplateDigest: "sha256:tmpl", FiberMax: 1,
+				Policy: core.Policy{Isolation: core.Trusted}}
+			be := newCodecBackend(core.TierCheckpoint)
+			be.noExit = true
+			rt := newTestRuntime(t, be, nil)
+			a := &core.Core{Runtime: rt, Ledger: core.NewLedger(1), Verify: parkGrantVerifier{g},
+				RateLimit: core.NewRateLimit(1000, 256<<20),
+				Store:     &core.SnapshotStore{Path: filepath.Join(t.TempDir(), "ledger.json")}}
+			ctx, cancel := context.WithCancel(context.Background())
+			req := core.CloneRequest{GrantJWT: []byte("grant"), Session: "S", Deadline: time.Second}
+			if action == "anonymous discard" {
+				req.Session = ""
+			}
+			first, code, err := a.Clone(ctx, req)
+			if err != nil || code != core.OK {
+				t.Fatalf("Clone = %d, %v", code, err)
+			}
+			cancel()
+			ref, _, err := a.Park(ctx, first.FiberID, true)
+			if !errors.Is(err, core.ErrParkUnconfirmed) {
+				t.Fatalf("pending Park = %v", err)
+			}
+			switch action {
+			case "yield":
+				a.Yield(ctx, "g1", "test")
+				if _, err := a.Admit(context.Background(), g); err != nil {
+					t.Fatal(err)
+				}
+			case "epoch":
+				a.Epoch, err = core.OpenEpochStore(t.TempDir())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := a.BumpEpoch(ctx, "test"); err != nil {
+					t.Fatal(err)
+				}
+			default:
+				if _, err := a.Release(ctx, first.FiberID, action != "release"); !errors.Is(err, core.ErrParkUnconfirmed) {
+					t.Fatalf("release without exit proof = %v", err)
+				}
+			}
+			saved, err := a.Store.Load()
+			if err != nil || len(saved.Sessions) != 1 || saved.Sessions[0].PendingParkRef != ref {
+				t.Fatalf("lost pending snapshot: %+v, %v", saved, err)
+			}
+			if a.Ledger.Statuses()[0].Running != 1 || !rt.HasDelta(ref) {
+				t.Fatal("unconfirmed revocation/release freed capacity or checkpoint")
+			}
+			rt.mu.Lock()
+			pending := rt.parks[first.FiberID]
+			rt.mu.Unlock()
+			be.die(first.FiberID, "signal:SIGKILL")
+			select {
+			case <-pending.done:
+			case <-time.After(time.Second):
+				t.Fatal("exit not reaped")
+			}
+			discard := action == "discard" || action == "anonymous discard"
+			if _, err := a.Release(context.Background(), first.FiberID, discard); err != nil {
+				t.Fatalf("confirmed pending Release = %v", err)
+			}
+			saved, err = a.Store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, s := range saved.Sessions {
+				if s.PendingParkRef != "" {
+					t.Fatal("completed pending release left a restart quarantine")
+				}
+			}
+			if len(rt.parks) != 0 || (discard && exists(ref)) || (!discard && !rt.HasDelta(ref)) {
+				t.Fatal("completed release leaked receipt or mishandled checkpoint")
 			}
 		})
 	}
@@ -195,6 +735,11 @@ func TestPark(t *testing.T) {
 				}
 				noExit(t, f.r)
 			}},
+		{name: "confirmed exit completes despite a kill command error", be: func() backend.Backend {
+			be := newCodecBackend(core.TierCheckpoint)
+			be.killErr = errors.New("fake: kill command response lost")
+			return be
+		}, grant: g, sync: true},
 		{name: "below the checkpoint tier", be: func() backend.Backend { return newFakeBackend(core.TierWarm) }, grant: g,
 			errText: "park needs FIBER_CHECKPOINT (backend fake offers FIBER_WARM)",
 			check: func(t *testing.T, f *parkFixture, _ string) {
@@ -358,7 +903,7 @@ func TestPark(t *testing.T) {
 			cb := newCodecBackend(core.TierCheckpoint)
 			cb.noExit = true
 			return cb
-		}, grant: g,
+		}, grant: g, wantErr: context.Canceled, wantRef: true,
 			ctx: func() context.Context {
 				ctx, cancel := context.WithCancel(context.Background())
 				cancel()

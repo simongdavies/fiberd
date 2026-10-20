@@ -29,6 +29,10 @@ func Subscribe(a *Core) chan struct{} { return a.subscribe() }
 // against a commit.
 func SetExitLookedUp(a *Core, fn func(fiberID string, known bool)) { a.exitLookedUp = fn }
 
+func SetExitBeforeSettle(a *Core, fn func()) { a.exitBeforeSettle = fn }
+
+func SetAdmitBeforePublish(a *Core, fn func()) { a.admitBeforePublish = fn }
+
 // Seq returns a spool's last assigned sequence number.
 func (s *Spool) Seq() uint64 {
 	s.mu.Lock()

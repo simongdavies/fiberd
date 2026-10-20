@@ -327,7 +327,7 @@ func TestFakeHelperProtocol(t *testing.T) {
 			be.Unwarm("g1")
 			awaitRun(t, s.started()[0])
 			got := []backend.Exit{awaitExit(t, be), awaitExit(t, be)}
-			want := []backend.Exit{{FiberID: f.ID, Status: "signal:helper"}, {WarmID: "g1", Status: "helper exited"}}
+			want := []backend.Exit{{FiberID: f.ID, Status: "signal:helper", Unconfirmed: true}, {WarmID: "g1", Status: "helper exited"}}
 			if !reflect.DeepEqual(got, want) {
 				t.Fatalf("exits = %+v, want %+v", got, want)
 			}
@@ -550,7 +550,7 @@ func TestReadLoop(t *testing.T) {
 				t.Fatalf("ask = %v", a.err)
 			}
 			exits := []backend.Exit{awaitExit(t, p.b), awaitExit(t, p.b)}
-			want := []backend.Exit{{FiberID: "f", Status: "signal:helper"}, {WarmID: "g1", Status: "helper exited"}}
+			want := []backend.Exit{{FiberID: "f", Status: "signal:helper", Unconfirmed: true}, {WarmID: "g1", Status: "helper exited"}}
 			if !reflect.DeepEqual(exits, want) {
 				t.Fatalf("exits = %+v, want %+v", exits, want)
 			}

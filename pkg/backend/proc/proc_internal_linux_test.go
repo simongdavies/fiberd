@@ -1188,14 +1188,19 @@ func TestResume(t *testing.T) {
 		wantErr   error
 		wantText  string
 		wantArgs  []string
-		wantExit  string
 		wantCalls string
 		// wantEndpoint is the endpoint the record names, with WORK for
 		// the run directory, "" for the restore's own.
-		wantEndpoint string
+		wantEndpoint  string
+		separateRoot  bool
+		probeErr      error
+		observeErr    error
+		rootWaitErr   error
+		observeExited bool
+		closeObserver bool
 	}{
-		{name: "plain checkpoint", wantArgs: []string{"restore ", "--pidfile", "files=0 cgroup=-1"}, wantExit: "exit:0"},
-		{name: "the record names the next generation and the session", spec: backend.ResumeSpec{Generation: 7, Session: "conv 42"}, wantExit: "exit:0"},
+		{name: "plain checkpoint", wantArgs: []string{"restore ", "--pidfile", "files=0 cgroup=-1"}},
+		{name: "the record names the next generation and the session", spec: backend.ResumeSpec{Generation: 7, Session: "conv 42"}},
 		{name: "a tree with no peer end to borrow is ended", noPair: true, ended: true, wantText: "borrow the channel's peer end"},
 		// The ack's wait is the spec's deadline. A tree that never acks
 		// is ended and no fiber is returned, so nothing routes to it.
@@ -1225,22 +1230,31 @@ func TestResume(t *testing.T) {
 				t.Fatal(err)
 			}
 		}, wantText: criu.MountsFile},
-		{name: "handoff channel replaced", record: true, spec: backend.ResumeSpec{Handoff: true}, wantArgs: []string{"--inherit-fd fd[3]:socket:[777]", "files=1"}, wantExit: "exit:0"},
+		{name: "handoff channel replaced", record: true, spec: backend.ResumeSpec{Handoff: true}, wantArgs: []string{"--inherit-fd fd[3]:socket:[777]", "files=1"}},
 		{name: "handoff checkpoint without a channel", record: true, wantText: "needs a channel"},
 		{name: "handoff resume of a plain checkpoint", spec: backend.ResumeSpec{Handoff: true}, wantText: "no handoff channel to replace"},
 		{name: "launcher handoff resume needs the warm instance for the channel", launcher: &fakeLauncher{}, spec: backend.ResumeSpec{Handoff: true, WarmID: "nobody"}, record: true,
 			wantText: `no warm instance "nobody"`, wantCalls: "restoreExtra:DIR,restoredGone"},
 		{name: "restore fails", criu: criuKnobs{restore: "no"}, wantText: "criu restore failed"},
 		{name: "restore misses the deadline", criu: criuKnobs{restore: "hang"}, spec: backend.ResumeSpec{Deadline: 50 * time.Millisecond}, wantErr: context.DeadlineExceeded},
-		{name: "the tree exits with an error", criu: criuKnobs{restoreErr: errors.New("exit status 3")}, wantExit: "exit:exit status 3"},
-		{name: "the tree is killed", kill: true, wantExit: "exit:signal: killed"},
+		{name: "an untyped restore wait error is not exit proof", criu: criuKnobs{restoreErr: errors.New("exit status 3")}},
+		{name: "a failed restore wait is not exit proof", criu: criuKnobs{restoreErr: syscall.ECHILD}},
+		{name: "successful supervisor completion does not end the root", separateRoot: true},
+		{name: "the fake kill reports an untyped wait error", kill: true},
+		{name: "unsupported observer refuses before restore", probeErr: syscall.ENOSYS, wantErr: syscall.ENOSYS, wantText: "before restore"},
+		{name: "root gone before capture refuses serving", observeErr: syscall.ESRCH, wantErr: syscall.ESRCH, wantText: "before capture", ended: true},
+		{name: "captured root already exited refuses serving", observeExited: true, wantErr: syscall.ESRCH, wantText: "before capture", ended: true},
+		{name: "resource failure keeps acknowledged root counted", observeErr: syscall.EMFILE},
+		{name: "capture permission failure keeps acknowledged root counted", observeErr: syscall.EACCES},
+		{name: "watch failure keeps acknowledged root counted", rootWaitErr: syscall.EIO},
+		{name: "backend close cancels watcher without root exit", closeObserver: true},
 		{name: "criu unavailable", criu: criuKnobs{checkErr: errors.New("exit status 1")}, wantText: "resume needs FIBER_CHECKPOINT"},
-		{name: "launcher restores in its container", launcher: &fakeLauncher{endpointRoot: "/host"}, wantArgs: []string{"--restore-extra"}, wantExit: "exit:0",
+		{name: "launcher restores in its container", launcher: &fakeLauncher{endpointRoot: "/host"}, wantArgs: []string{"--restore-extra"},
 			wantCalls: "restoreExtra:DIR,restored:PID,restoredGone", wantEndpoint: "/host/ep.sock"},
 		{name: "launcher tree with no peer end to borrow is ended", launcher: &fakeLauncher{}, noPair: true, ended: true, wantText: "borrow the channel's peer end",
 			wantCalls: "restoreExtra:DIR,restored:PID,restoredGone"},
 		{name: "launcher restore without a run directory takes the endpoint's", launcher: &fakeLauncher{restoredErr: errors.New("mounts")}, spec: backend.ResumeSpec{WorkDir: "-"},
-			wantArgs: []string{"--restore-extra"}, wantExit: "exit:0", wantCalls: "restoreExtra:DIR,restored:PID,restoredGone", wantEndpoint: "ep.sock"},
+			wantArgs: []string{"--restore-extra"}, wantCalls: "restoreExtra:DIR,restored:PID,restoredGone", wantEndpoint: "ep.sock"},
 		{name: "launcher cannot prepare the restore", launcher: &fakeLauncher{restoreExtraErr: errors.New("no rootfs")}, wantText: "no rootfs", wantCalls: "restoreExtra:DIR"},
 		{name: "launcher prepared, restore fails", launcher: &fakeLauncher{}, criu: criuKnobs{restore: "no"}, wantText: "criu restore failed", wantCalls: "restoreExtra:DIR,restoredGone"},
 	}
@@ -1248,12 +1262,43 @@ func TestResume(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakes(t)
 			f.criu.criuKnobs = tc.criu
+			var rootEnded chan struct{}
+			if tc.separateRoot || tc.criu.restoreErr != nil || tc.closeObserver {
+				rootEnded = make(chan struct{})
+			}
 			var launcher Launcher
 			if tc.launcher != nil {
 				launcher = tc.launcher
 			}
 			rootBind := filepath.Join(t.TempDir(), "parent", "root")
-			b := f.open(t, Options{Launcher: launcher, RootBind: rootBind})
+			opts := Options{Launcher: launcher, RootBind: rootBind}
+			var captured rootExitObserver
+			if rootEnded != nil {
+				opts.observeRoot = func(pid int) (rootExitObserver, error) {
+					captured = &fakeRootExit{done: rootEnded}
+					return captured, nil
+				}
+			}
+			if tc.probeErr != nil {
+				opts.probeRoot = func() error { return tc.probeErr }
+			}
+			if tc.observeErr != nil {
+				opts.observeRoot = func(int) (rootExitObserver, error) { return nil, tc.observeErr }
+			}
+			if tc.rootWaitErr != nil {
+				opts.observeRoot = func(pid int) (rootExitObserver, error) {
+					p := f.criu.restored()[0]
+					return &fakeRootExit{done: p.released, waitErr: tc.rootWaitErr}, nil
+				}
+			}
+			if tc.observeExited {
+				opts.observeRoot = func(int) (rootExitObserver, error) {
+					dead := make(chan struct{})
+					close(dead)
+					return &fakeRootExit{done: dead}, nil
+				}
+			}
+			b := f.open(t, opts)
 			dir := t.TempDir()
 			if tc.record {
 				if err := os.WriteFile(filepath.Join(dir, handoffFile), []byte(`{"inode":"777"}`), 0o600); err != nil {
@@ -1299,6 +1344,9 @@ func TestResume(t *testing.T) {
 			if tc.wantErr != nil || tc.wantText != "" {
 				if err == nil || (tc.wantErr != nil && !errors.Is(err, tc.wantErr)) || !strings.Contains(err.Error(), tc.wantText) {
 					t.Fatalf("Resume = %v, want %q (errors.Is %v)", err, tc.wantText, tc.wantErr)
+				}
+				if tc.probeErr != nil && len(f.criu.restored()) != 0 {
+					t.Fatal("observer preflight failure started a restored root")
 				}
 				if b.rootHeld {
 					t.Fatal("a refused resume holds the restore root")
@@ -1354,6 +1402,49 @@ func TestResume(t *testing.T) {
 					}
 				}
 				p := f.criu.restored()[0]
+				if tc.closeObserver {
+					b.Close()
+					if _, err := captured.Exited(); !errors.Is(err, os.ErrClosed) {
+						t.Fatalf("backend close did not close pidfd: %v", err)
+					}
+					select {
+					case <-rootEnded:
+						t.Fatal("closing the watcher ended the modeled root")
+					default:
+					}
+					select {
+					case e := <-b.Exits():
+						t.Fatalf("watcher cancellation supplied root exit proof: %+v", e)
+					case <-time.After(30 * time.Millisecond):
+					}
+					p.release(nil)
+					return
+				}
+				if tc.observeErr != nil || tc.rootWaitErr != nil {
+					p.release(nil)
+					want := tc.observeErr
+					if want == nil {
+						want = tc.rootWaitErr
+					}
+					waitFor(t, "observer failure is recorded", func() bool {
+						b.mu.Lock()
+						defer b.mu.Unlock()
+						return b.fibers[fb.ID] != nil && errors.Is(b.fibers[fb.ID].rootErr, want)
+					})
+					before := len(f.criu.recorded())
+					if err := b.Park(context.Background(), fb.ID, backend.ParkSpec{Dir: t.TempDir()}); !errors.Is(err, want) {
+						t.Fatalf("Park did not expose observer failure: %v", err)
+					}
+					if len(f.criu.recorded()) != before {
+						t.Fatal("observer failure attempted a dump")
+					}
+					select {
+					case e := <-b.Exits():
+						t.Fatalf("observer failure freed a running incarnation: %+v", e)
+					case <-time.After(30 * time.Millisecond):
+					}
+					return
+				}
 				if tc.kill {
 					// Kill signals the restored root, a pid nobody has
 					// here, so the kernel ending the tree is played by
@@ -1363,10 +1454,18 @@ func TestResume(t *testing.T) {
 					}
 					_ = p.Kill()
 				} else {
-					p.release(tc.criu.restoreErr)
+					p.release(f.criu.restoreErr)
 				}
-				if e := waitExit(t, b); e != (backend.Exit{FiberID: "g/2-1", Status: tc.wantExit}) {
-					t.Fatalf("exit = %+v, want %s", e, tc.wantExit)
+				if rootEnded != nil {
+					select {
+					case e := <-b.Exits():
+						t.Fatalf("supervisor completion supplied root exit proof: %+v", e)
+					case <-time.After(30 * time.Millisecond):
+					}
+					close(rootEnded)
+				}
+				if e := waitExit(t, b); e != (backend.Exit{FiberID: "g/2-1", Status: "exited"}) {
+					t.Fatalf("root exit = %+v, want an independently observed root death", e)
 				}
 				b.mu.Lock()
 				n := len(b.fibers)

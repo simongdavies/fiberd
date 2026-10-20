@@ -2,16 +2,19 @@ package core_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/helayoty/fiberd/pkg/core"
+	"github.com/helayoty/fiberd/pkg/core/coretest"
 )
 
 // listingRuntime is a fakeRuntime that reports running fibers and knows
@@ -27,6 +30,294 @@ type listingRuntime struct {
 	// home while the runtime works.
 	onRelease func(id string)
 	dropped   []string // every grant whose template fiberd dropped
+}
+
+type quarantiningRuntime struct {
+	*listingRuntime
+	quarantined map[string]string
+	discarded   []string
+}
+
+func (r *quarantiningRuntime) QuarantinePark(_ context.Context, id, ref string) error {
+	r.quarantined[id] = ref
+	return nil
+}
+
+func (r *quarantiningRuntime) Park(_ context.Context, id string, _ bool) (string, error) {
+	return r.quarantined[id], core.ErrParkUnconfirmed
+}
+
+func (r *quarantiningRuntime) Release(ctx context.Context, id string, discard bool) error {
+	if r.quarantined[id] != "" {
+		return core.ErrParkUnconfirmed
+	}
+	return r.listingRuntime.Release(ctx, id, discard)
+}
+
+func (r *quarantiningRuntime) DiscardDelta(_ context.Context, ref string) error {
+	r.discarded = append(r.discarded, ref)
+	return nil
+}
+
+func TestReconcilePendingParkQuarantine(t *testing.T) {
+	g := core.Grant{UID: "g1", Tenant: "acme", Audience: "node-a", FiberMax: 2, Token: "g1"}
+	other := core.Grant{UID: "g2", Tenant: "acme", Audience: "node-a", FiberMax: 1, Token: "g2"}
+	old := core.Fence{GrantUID: "g1", Epoch: 1, Seq: 1}
+	snap := core.Snapshot{Epoch: 1, Grants: []core.Grant{g, other}, Sessions: []core.SessionSnapshot{
+		{Name: "S", GrantUID: "g1", State: core.StateRunning, Fence: old, FiberID: old.String(),
+			DeltaRef: "consumed-old-source", PendingParkRef: "saved-new-checkpoint"},
+	}}
+	for _, supported := range []bool{false, true} {
+		t.Run(fmt.Sprintf("supported=%v", supported), func(t *testing.T) {
+			a := newCore(t, "up", core.TierCheckpoint, g, other)
+			a.Ledger = core.NewLedger(2)
+			base := &listingRuntime{fakeRuntime: fakeRuntime{tier: core.TierCheckpoint},
+				running: []core.FiberHandle{{ID: old.String()}}}
+			rt := &quarantiningRuntime{listingRuntime: base, quarantined: map[string]string{}}
+			a.Runtime = base
+			if supported {
+				a.Runtime = rt
+			}
+			a.Store = &core.SnapshotStore{Path: filepath.Join(t.TempDir(), "ledger.json")}
+			if err := a.Store.Persist(func() core.Snapshot { return snap }); err != nil {
+				t.Fatal(err)
+			}
+			ctx := context.Background()
+			_, err := a.Reconcile(ctx, snap)
+			if !supported {
+				if !errors.Is(err, core.ErrParkUnconfirmed) || len(a.Ledger.Statuses()) != 0 || len(base.released) != 0 {
+					t.Fatalf("unsupported runtime did not fail safely before admission: %v", err)
+				}
+				saved, _ := a.Store.Load()
+				if len(saved.Sessions) != 1 || saved.Sessions[0].PendingParkRef != "saved-new-checkpoint" {
+					t.Fatal("unsupported runtime overwrote pending evidence")
+				}
+				return
+			}
+			if err != nil || rt.quarantined[old.String()] != "saved-new-checkpoint" || len(base.released) != 0 || len(rt.discarded) != 0 {
+				t.Fatalf("Reconcile = %v, released=%v discarded=%v", err, base.released, rt.discarded)
+			}
+			req := core.CloneRequest{GrantJWT: []byte("g1"), Session: "S", Deadline: time.Second}
+			if _, _, err := a.Clone(ctx, req); !errors.Is(err, core.ErrParkUnconfirmed) {
+				t.Fatalf("pending session attached or resumed: %v", err)
+			}
+			req.Session = "unrelated"
+			if _, code, err := a.Clone(ctx, req); code != core.OK || err != nil {
+				t.Fatalf("unrelated session cannot run: %d, %v", code, err)
+			}
+			req.Session = "over-capacity"
+			if _, _, err := a.Clone(ctx, req); !errors.Is(err, core.ErrGrantFull) {
+				t.Fatalf("pending slot was not reserved: %v", err)
+			}
+			if _, code, err := a.Clone(ctx, core.CloneRequest{GrantJWT: []byte("g2"), Session: "other-grant", Deadline: time.Second}); code != core.OK || err != nil {
+				t.Fatalf("unrelated grant cannot run: %d, %v", code, err)
+			}
+			a.OnExit(ctx, core.FiberExit{FiberID: old.String(), Reason: "exit"})
+			for _, discard := range []bool{false, true} {
+				if _, err := a.Release(ctx, old.String(), discard); !errors.Is(err, core.ErrParkUnconfirmed) {
+					t.Fatalf("recovered pending release accepted without proof: %v", err)
+				}
+			}
+			saved, err := a.Store.Load()
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, s := range saved.Sessions {
+				if s.FiberID == old.String() {
+					found = s.PendingParkRef == "saved-new-checkpoint" && s.DeltaRef == "consumed-old-source"
+				}
+			}
+			if !found || len(rt.discarded) != 0 {
+				t.Fatal("pending checkpoint or consumed source was discarded")
+			}
+		})
+	}
+}
+
+func TestHeldPendingParksSurviveAdmissionAndSnapshot(t *testing.T) {
+	g := core.Grant{UID: "g1", Tenant: "acme", Audience: "node-a", Token: "g1", FiberMax: 3}
+	other := core.Grant{UID: "g2", Tenant: "acme", Audience: "node-a", Token: "g2", FiberMax: 1}
+	a := newCore(t, "up", core.TierCheckpoint, g, other)
+	a.Ledger = core.NewLedger(2)
+	a.Verify = acceptVerifier{grants: map[string]core.Grant{"g1": g, "g2": other}, unavailable: map[string]bool{"g1": true}}
+	a.Store = &core.SnapshotStore{Path: filepath.Join(t.TempDir(), "ledger.json")}
+	rt := &quarantiningRuntime{listingRuntime: &listingRuntime{fakeRuntime: fakeRuntime{tier: core.TierCheckpoint}}, quarantined: map[string]string{}}
+	a.Runtime = rt
+	snap := core.Snapshot{Epoch: 1, Grants: []core.Grant{g, other}}
+	for seq := uint64(1); seq <= 2; seq++ {
+		f := core.Fence{GrantUID: "g1", Epoch: 1, Seq: seq}
+		snap.Sessions = append(snap.Sessions, core.SessionSnapshot{GrantUID: "g1", State: core.StateRunning,
+			Fence: f, FiberID: f.String(), PendingParkRef: fmt.Sprintf("pending-%d", seq)})
+	}
+	if _, err := a.Reconcile(context.Background(), snap); err != nil {
+		t.Fatal(err)
+	}
+	saved, err := a.Store.Load()
+	if err != nil || len(saved.Sessions) != 2 {
+		t.Fatalf("held anonymous pending parks lost: %+v, %v", saved, err)
+	}
+	a.Verify = acceptVerifier{grants: map[string]core.Grant{"g1": g, "g2": other}}
+	if _, err := a.Admit(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	status, ok := coretest.GrantStatus(a.Ledger, "g1")
+	if !ok || status.Running != 2 || status.Parked != 0 {
+		t.Fatalf("re-admission lost reserved slots: %+v", status)
+	}
+	saved, err = a.Store.Load()
+	if err != nil || len(saved.Sessions) != 2 {
+		t.Fatalf("admission lost pending evidence: %+v, %v", saved, err)
+	}
+}
+
+func TestPendingParkSnapshotCompatibility(t *testing.T) {
+	var legacy core.SessionSnapshot
+	if err := json.Unmarshal([]byte(`{"name":"S","grant_uid":"g1","state":0,"delta_ref":"consumed"}`), &legacy); err != nil {
+		t.Fatal(err)
+	}
+	data, err := json.Marshal(legacy)
+	if err != nil || legacy.PendingParkRef != "" || strings.Contains(string(data), "pending_park_ref") {
+		t.Fatalf("legacy snapshot changed: %s, %v", data, err)
+	}
+	legacy.PendingParkRef = "saved-new"
+	data, err = json.Marshal(legacy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var restored core.SessionSnapshot
+	if err := json.Unmarshal(data, &restored); err != nil || restored.PendingParkRef != "saved-new" || restored.DeltaRef != "consumed" {
+		t.Fatalf("pending snapshot conflates saved/consumed state: %+v, %v", restored, err)
+	}
+}
+
+func TestExitRacingPendingParkPreservesCheckpoint(t *testing.T) {
+	g := core.Grant{UID: "g1", Tenant: "acme", Audience: "node-a", FiberMax: 1}
+	a := newCore(t, "up", core.TierCheckpoint, g)
+	a.Runtime = fakeRuntime{tier: core.TierCheckpoint, parkRef: true, parkFail: core.ErrParkUnconfirmed}
+	a.Store = &core.SnapshotStore{Path: filepath.Join(t.TempDir(), "ledger.json")}
+	ctx := context.Background()
+	first, _, err := a.Clone(ctx, core.CloneRequest{GrantJWT: []byte("g1"), Session: "S", Deadline: time.Second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, settle, done := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	core.SetExitBeforeSettle(a, func() { close(entered); <-settle })
+	go func() {
+		a.OnExit(ctx, core.FiberExit{FiberID: first.FiberID, Reason: "exit"})
+		close(done)
+	}()
+	<-entered
+	ref, _, err := a.Park(ctx, first.FiberID, true)
+	if !errors.Is(err, core.ErrParkUnconfirmed) {
+		t.Fatal(err)
+	}
+	close(settle)
+	<-done
+	if _, known := a.Ledger.Fiber(first.FiberID); !known || a.Ledger.PendingPark(first.FiberID, "") != ref {
+		t.Fatal("racing exit freed pending capacity/checkpoint")
+	}
+}
+
+func TestHeldPendingAdmissionIsAtomicWithClone(t *testing.T) {
+	for _, session := range []string{"S", "different"} {
+		t.Run(session, func(t *testing.T) {
+			g := core.Grant{UID: "g1", Tenant: "acme", Audience: "node-a", Token: "g1", FiberMax: 1}
+			a := newCore(t, "up", core.TierCheckpoint, g)
+			a.Ledger = core.NewLedger(2)
+			rt := &quarantiningRuntime{listingRuntime: &listingRuntime{fakeRuntime: fakeRuntime{tier: core.TierCheckpoint}}, quarantined: map[string]string{}}
+			a.Runtime = rt
+			a.Store = &core.SnapshotStore{Path: filepath.Join(t.TempDir(), "ledger.json")}
+			a.Verify = acceptVerifier{down: true}
+			old := core.Fence{GrantUID: "g1", Epoch: 1, Seq: 1}
+			snap := core.Snapshot{Epoch: 1, Grants: []core.Grant{g}, Sessions: []core.SessionSnapshot{
+				{Name: "S", GrantUID: "g1", State: core.StateRunning, Fence: old, FiberID: old.String(), PendingParkRef: "saved"},
+			}}
+			ctx := context.Background()
+			if _, err := a.Reconcile(ctx, snap); err != nil {
+				t.Fatal(err)
+			}
+			a.Verify = acceptVerifier{grants: map[string]core.Grant{"g1": g}}
+			entered, proceed := make(chan struct{}), make(chan struct{})
+			var release sync.Once
+			t.Cleanup(func() { release.Do(func() { close(proceed) }) })
+			core.SetAdmitBeforePublish(a, func() { close(entered); <-proceed })
+			admitted := make(chan error, 1)
+			go func() { _, err := a.Admit(ctx, g); admitted <- err }()
+			<-entered
+			if _, visible := a.Ledger.Grant("g1"); visible {
+				t.Error("grant visible before held reservations were restored")
+			}
+			cloned := make(chan error, 1)
+			go func() {
+				_, _, err := a.Clone(ctx, core.CloneRequest{GrantJWT: []byte("g1"), Session: session, Deadline: time.Second})
+				cloned <- err
+			}()
+			select {
+			case err := <-cloned:
+				t.Errorf("concurrent Clone passed incomplete admission: %v", err)
+				release.Do(func() { close(proceed) })
+				<-admitted
+				return
+			case <-time.After(30 * time.Millisecond):
+			}
+			release.Do(func() { close(proceed) })
+			if err := <-admitted; err != nil {
+				t.Fatal(err)
+			}
+			err := <-cloned
+			want := core.ErrGrantFull
+			if session == "S" {
+				want = core.ErrParkUnconfirmed
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("concurrent Clone = %v, want %v", err, want)
+			}
+			status, _ := coretest.GrantStatus(a.Ledger, "g1")
+			saved, err := a.Store.Load()
+			if status.Running != 1 || err != nil || len(saved.Sessions) != 1 || saved.Sessions[0].PendingParkRef != "saved" {
+				t.Fatalf("admission lost reservation/evidence: %+v %+v %v", status, saved, err)
+			}
+		})
+	}
+}
+
+func TestFailedPendingAdmissionKeepsHeldEvidence(t *testing.T) {
+	g := core.Grant{UID: "g1", Tenant: "acme", Audience: "node-a", Token: "g1", FiberMax: 2}
+	a := newCore(t, "up", core.TierCheckpoint, g)
+	a.Ledger = core.NewLedger(2)
+	a.Verify = acceptVerifier{down: true}
+	a.Store = &core.SnapshotStore{Path: filepath.Join(t.TempDir(), "ledger.json")}
+	a.Runtime = &quarantiningRuntime{listingRuntime: &listingRuntime{fakeRuntime: fakeRuntime{tier: core.TierCheckpoint}}, quarantined: map[string]string{}}
+	snap := core.Snapshot{Epoch: 1, Grants: []core.Grant{g}}
+	for seq := uint64(1); seq <= 2; seq++ {
+		f := core.Fence{GrantUID: "g1", Epoch: 1, Seq: seq}
+		snap.Sessions = append(snap.Sessions, core.SessionSnapshot{GrantUID: "g1", State: core.StateRunning,
+			Fence: f, FiberID: f.String(), PendingParkRef: fmt.Sprintf("saved-%d", seq)})
+	}
+	ctx := context.Background()
+	if _, err := a.Reconcile(ctx, snap); err != nil {
+		t.Fatal(err)
+	}
+	narrow := g
+	narrow.FiberMax = 1
+	if _, err := a.Admit(ctx, narrow); !errors.Is(err, core.ErrGrantFull) {
+		t.Fatalf("over-budget held reservations admitted: %v", err)
+	}
+	if _, visible := a.Ledger.Grant("g1"); visible || len(a.Ledger.RunningFibers()) != 0 {
+		t.Fatal("failed admission partially exposed the grant or reservations")
+	}
+	saved, err := a.Store.Load()
+	if err != nil || len(saved.Sessions) != 2 {
+		t.Fatalf("failed admission lost held evidence: %+v, %v", saved, err)
+	}
+	if _, err := a.Admit(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+	status, _ := coretest.GrantStatus(a.Ledger, "g1")
+	if status.Running != 2 {
+		t.Fatalf("retry lost held reservations: %+v", status)
+	}
 }
 
 func (l *listingRuntime) List(context.Context) ([]core.FiberHandle, error) {

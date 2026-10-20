@@ -73,7 +73,8 @@ type Options struct {
 	CRIU string
 	// CRIUWrap is a command `criu restore` runs through, with criu's
 	// argv after its own (criu.Options.Wrap). A launcher whose restores
-	// need mounts of their own sets it.
+	// need mounts of their own sets it. It must preserve the observer's
+	// host PID namespace; the root PID file is read in that namespace.
 	CRIUWrap []string
 	// Launcher, when set, starts the zygote some other way than a plain
 	// exec: inside an OCI container (pkg/backend/runc). Fibers are still
@@ -91,7 +92,8 @@ type Options struct {
 	// stale bind at the same path when it opens.
 	RootBind string
 	// Commander runs criu (criu.Options.Commander). Nil runs the binary
-	// CRIU names.
+	// CRIU names. A custom commander must write trusted host-namespace
+	// root PIDs, as required by the existing signal/borrow operations.
 	Commander criu.Commander
 	// Borrow takes a duplicate of descriptor fd of process pid, as
 	// pidfd_getfd(2) does, which a park and a resume use to reach the
@@ -109,6 +111,9 @@ type Options struct {
 	// procRoot is where the host reads /proc. "" is /proc, and a test
 	// points it at a directory of its own.
 	procRoot string
+	// Private syscall seams for restored-root death observation.
+	observeRoot func(int) (rootExitObserver, error)
+	probeRoot   func() error
 }
 
 // process is a started zygote command, what the backend needs of an
@@ -194,8 +199,12 @@ type Backend struct {
 	// meaningful with the zygote that reported it. With a launcher every
 	// zygote is the init of a pid namespace of its own, so two zygotes
 	// may both report pid 7.
-	byPID map[pidKey]*fiber
-	exits chan backend.Exit
+	byPID       map[pidKey]*fiber
+	exits       chan backend.Exit
+	rootCtx     context.Context
+	stopRoots   context.CancelFunc
+	rootWaiters sync.WaitGroup
+	closed      bool
 
 	// defaultRoot means RootBind is the default fiberd-root-<pid>, so this
 	// backend cleans stale siblings left by dead pids. rootHeld means this
@@ -541,8 +550,9 @@ type fiber struct {
 	zpid     int // as the zygote reported it (its own pid namespace); 0 for restored trees
 	warmID   string
 	restored *criu.Restored
-	handoff  bool // serves handoff, so it holds its channel at channelFD
-	parks    int  // the park rounds asked of it so far, under b.mu
+	rootErr  error // unavailable death evidence; under Backend.mu
+	handoff  bool  // serves handoff, so it holds its channel at channelFD
+	parks    int   // the park rounds asked of it so far, under b.mu
 	// runDir is where the fiber's mount namespace binds its grant's run
 	// directory (RUNDIR). The path is fixed at birth and survives every
 	// park and resume, while the host directory behind it is the resuming
@@ -619,9 +629,16 @@ func NewBackend(o Options) *Backend {
 	if o.Signal == nil {
 		o.Signal = syscall.Kill
 	}
+	if o.observeRoot == nil {
+		o.observeRoot = observeRootExit
+	}
+	if o.probeRoot == nil {
+		o.probeRoot = probeRootExit
+	}
+	rootCtx, stopRoots := context.WithCancel(context.Background())
 	b := &Backend{opt: o, criu: criu.Options{Bin: o.CRIU, Wrap: o.CRIUWrap, Commander: o.Commander}, tier: core.TierWarm, defaultRoot: defaultRoot,
 		zygotes: map[string]*zygote{}, fibers: map[string]*fiber{}, byPID: map[pidKey]*fiber{},
-		exits: make(chan backend.Exit, 1024)}
+		exits: make(chan backend.Exit, 1024), rootCtx: rootCtx, stopRoots: stopRoots}
 	if o.Launcher == nil {
 		// A launcher's fibers restore in its container, never on the
 		// restore root. Only the plain fork backend owns one.
@@ -1284,6 +1301,10 @@ func (b *Backend) exited(z *zygote, zpid int, status string) {
 
 // finish forgets a fiber and reports its end.
 func (b *Backend) finish(f *fiber, status string) {
+	b.finishExit(f, status, false)
+}
+
+func (b *Backend) finishExit(f *fiber, status string, unconfirmed bool) {
 	b.mu.Lock()
 	if b.fibers[f.id] != f {
 		b.mu.Unlock()
@@ -1294,7 +1315,15 @@ func (b *Backend) finish(f *fiber, status string) {
 		delete(b.byPID, pidKey{f.warmID, f.zpid})
 	}
 	b.mu.Unlock()
-	b.exits <- backend.Exit{FiberID: f.id, Status: status}
+	exit := backend.Exit{FiberID: f.id, Status: status, Unconfirmed: unconfirmed}
+	if f.restored != nil && b.rootCtx != nil {
+		select {
+		case b.exits <- exit:
+		case <-b.rootCtx.Done():
+		}
+	} else {
+		b.exits <- exit
+	}
 }
 
 // fiberEndpoint is endpoint as a fiber of z binds it. A unix path under
@@ -1432,15 +1461,20 @@ func (b *Backend) Park(ctx context.Context, fiberID string, spec backend.ParkSpe
 	f, ok := b.fibers[fiberID]
 	var z *zygote
 	var pid, round int
+	var rootErr error
 	if ok {
 		z = b.zygotes[f.warmID]
 		pid = f.pid
 		f.parks++
 		round = f.parks
+		rootErr = f.rootErr
 	}
 	b.mu.Unlock()
 	if !ok {
 		return fmt.Errorf("proc: unknown fiber %q", fiberID)
+	}
+	if rootErr != nil {
+		return fmt.Errorf("proc: cannot park %s without restored-root exit evidence: %w", fiberID, rootErr)
 	}
 	if pid <= 0 {
 		return fmt.Errorf("proc: fiber %q has no host pid to dump", fiberID)
@@ -1670,8 +1704,8 @@ func pidfdBorrow(pid, fd int) (*os.File, error) {
 	return os.NewFile(uintptr(got), "borrowed"), nil
 }
 
-// restoreDone is a channel closed once the restored tree has ended, for
-// a resume that is given up after the restore.
+// restoreDone reaps the supervisor during existing failed-resume rollback.
+// It is not a restored-root exit receipt.
 func restoreDone(res *criu.Restored) <-chan struct{} {
 	done := make(chan struct{})
 	go func() { _ = res.Wait(); close(done) }()
@@ -1703,11 +1737,18 @@ func runDirInherit(dir, workDir string) ([]string, string, error) {
 	return []string{"--external", "mnt[" + runDirKey + "]:" + filepath.Clean(workDir)}, rec.MountPoint, nil
 }
 
-// Resume restores a checkpoint into the given cgroup; criu stays as the
-// tree's parent and its exit is reported as the fiber's.
+// Resume restores a checkpoint into the given cgroup. A read-only pidfd
+// captured before the record exchange observes root death independently
+// of CRIU, whose exit is not an incarnation-specific termination receipt.
 func (b *Backend) Resume(ctx context.Context, spec backend.ResumeSpec) (backend.Fiber, error) {
 	if b.tier < core.TierCheckpoint {
 		return backend.Fiber{}, fmt.Errorf("proc: resume needs %s (criu unavailable)", core.TierCheckpoint)
+	}
+	if err := b.rootCtx.Err(); err != nil {
+		return backend.Fiber{}, err
+	}
+	if err := b.opt.probeRoot(); err != nil {
+		return backend.Fiber{}, fmt.Errorf("proc: restored-root observer unavailable before restore: %w", err)
 	}
 	rctx := ctx
 	if spec.Deadline > 0 {
@@ -1810,6 +1851,38 @@ func (b *Backend) Resume(ctx context.Context, spec backend.ResumeSpec) (backend.
 		gone()
 		return backend.Fiber{}, err
 	}
+	// CRIU's PID file is trusted and uses this observer's host PID
+	// namespace (the runc wrapper changes mounts, not PID namespaces).
+	// If the number was reused before capture, the original root already
+	// died: this read-only observer may delay proof but cannot prove its
+	// death prematurely. It does not authenticate the serving incarnation.
+	root, rootErr := b.opt.observeRoot(res.PID)
+	if rootErr == nil {
+		var exited bool
+		exited, rootErr = root.Exited()
+		if exited && rootErr == nil {
+			rootErr = syscall.ESRCH
+		}
+	}
+	if rootErr != nil && root != nil {
+		if err := root.Close(); err != nil {
+			log.Printf("proc: close failed restored-root observer: %v", err)
+		}
+		root = nil
+	}
+	if errors.Is(rootErr, syscall.ESRCH) {
+		_ = res.Process.Kill()
+		<-restoreDone(res)
+		closeHost()
+		gone()
+		return backend.Fiber{}, fmt.Errorf("proc: restored root ended before capture: %w", rootErr)
+	}
+	if rootErr != nil {
+		// The root may be alive. Keep an acknowledged running birth
+		// counted rather than introduce an error that frees its slot.
+		// Park refuses before dumping; no supervisor result substitutes.
+		log.Printf("proc: restored root %d exit observer unavailable: %v", res.PID, rootErr)
+	}
 	if b.opt.Launcher != nil {
 		if err := b.opt.Launcher.Restored(wspec, res.PID); err != nil {
 			log.Printf("%s: restored %s: %v", b.Name(), spec.Fence, err)
@@ -1835,23 +1908,54 @@ func (b *Backend) Resume(ctx context.Context, spec backend.ResumeSpec) (backend.
 		_ = res.Process.Kill()
 		<-restoreDone(res)
 		closeHost()
+		if root != nil {
+			_ = root.Close()
+		}
 		gone()
 		return backend.Fiber{}, fmt.Errorf("%s: %s: %w", b.Name(), spec.Fence, ack)
 	}
-	f := &fiber{id: spec.Fence, pid: res.PID, restored: res, warmID: spec.WarmID, handoff: spec.Handoff, runDir: runDir}
+	f := &fiber{id: spec.Fence, pid: res.PID, restored: res, warmID: spec.WarmID, handoff: spec.Handoff, runDir: runDir, rootErr: rootErr}
 	b.mu.Lock()
 	b.fibers[f.id] = f
+	if root != nil {
+		if b.closed {
+			f.rootErr = context.Canceled
+			_ = root.Close()
+		} else {
+			b.rootWaiters.Add(1)
+			go b.watchRoot(f, root, gone)
+		}
+	}
 	b.mu.Unlock()
 	go func() {
 		err := res.Wait()
-		status := "exit:0"
 		if err != nil {
-			status = "exit:" + err.Error()
+			log.Printf("proc: CRIU supervisor of %s ended: %v; not root exit evidence", f.id, err)
 		}
-		b.finish(f, status)
-		gone()
 	}()
 	return backend.Fiber{ID: f.id, PID: f.pid, Channel: hostEnd}, nil
+}
+
+func (b *Backend) watchRoot(f *fiber, root rootExitObserver, gone func()) {
+	defer b.rootWaiters.Done()
+	defer func() {
+		if err := root.Close(); err != nil {
+			log.Printf("proc: close root observer for %s: %v", f.id, err)
+		}
+	}()
+	if err := root.Wait(b.rootCtx); err != nil {
+		if b.rootCtx.Err() == nil {
+			b.mu.Lock()
+			if b.fibers[f.id] == f {
+				f.rootErr = err
+			}
+			b.mu.Unlock()
+			log.Printf("proc: root exit observation for %s failed: %v", f.id, err)
+		}
+		return
+	}
+	b.finish(f, "exited")
+	gone()
 }
 
 // Kill ends the fiber's root process; the exit is reported like any other.
@@ -1881,11 +1985,16 @@ func (b *Backend) Exits() <-chan backend.Exit { return b.exits }
 // restore root.
 func (b *Backend) Close() {
 	b.mu.Lock()
+	b.closed = true
 	zs := make([]*zygote, 0, len(b.zygotes))
 	for _, z := range b.zygotes {
 		zs = append(zs, z)
 	}
 	b.mu.Unlock()
+	if b.stopRoots != nil {
+		b.stopRoots()
+	}
+	b.rootWaiters.Wait()
 	for _, z := range zs {
 		_ = z.ctl.Close()
 		_ = z.process.Kill()

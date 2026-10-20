@@ -807,6 +807,21 @@ func queued(fd int) bool {
 func (f *fakes) open(t *testing.T, o Options) *Backend {
 	t.Helper()
 	o.spawn, o.procRoot, o.Commander, o.Borrow, o.Signal = f.spawn.spawn, f.proc, f.criu, f.borrow, f.signal
+	if o.probeRoot == nil {
+		o.probeRoot = func() error { return nil }
+	}
+	if o.observeRoot == nil {
+		o.observeRoot = func(pid int) (rootExitObserver, error) {
+			for _, p := range f.criu.restored() {
+				if p.pid == pid {
+					// Legacy fixtures end their fake root with the fake
+					// supervisor. Native observer cases override this.
+					return &fakeRootExit{done: p.released}, nil
+				}
+			}
+			return nil, syscall.ESRCH
+		}
+	}
 	if o.RootBind == "" {
 		o.RootBind = filepath.Join(t.TempDir(), "root")
 	}
@@ -824,6 +839,38 @@ func (f *fakes) open(t *testing.T, o Options) *Backend {
 		goleak.VerifyNone(t)
 	})
 	return b
+}
+
+type fakeRootExit struct {
+	done    <-chan struct{}
+	waitErr error
+	closed  atomic.Bool
+}
+
+func (o *fakeRootExit) Exited() (bool, error) {
+	if o.closed.Load() {
+		return false, os.ErrClosed
+	}
+	select {
+	case <-o.done:
+		return true, nil
+	default:
+		return false, nil
+	}
+}
+
+func (o *fakeRootExit) Wait(ctx context.Context) error {
+	select {
+	case <-o.done:
+		return o.waitErr
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+func (o *fakeRootExit) Close() error {
+	o.closed.Store(true)
+	return nil
 }
 
 // warm starts a scripted zygote for grant g, with its run directory under

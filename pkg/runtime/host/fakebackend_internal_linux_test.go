@@ -68,6 +68,7 @@ type fakeBackend struct {
 
 	// Knobs a test sets before calling the runtime.
 	warmErr, cloneErr, parkErr, resumeErr error
+	killErr                               error
 	warm                                  backend.Warm
 	// footprint is what Clone, Bind and Resume report as the leaf's own
 	// count before the hand-out.
@@ -336,11 +337,11 @@ func (b *fakeBackend) Kill(fiberID string) error {
 	b.killed = append(b.killed, fiberID)
 	f := b.fibers[fiberID]
 	if f == nil || !f.alive || b.noExit {
-		return nil
+		return b.killErr
 	}
 	f.end()
 	b.exits <- backend.Exit{FiberID: fiberID, Status: "signal:SIGKILL"}
-	return nil
+	return b.killErr
 }
 
 func (b *fakeBackend) Exits() <-chan backend.Exit { return b.exits }
